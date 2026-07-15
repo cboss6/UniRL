@@ -504,7 +504,14 @@ class BucketedIPCReceiveMixin:
         )
         if manager is None:
             return {}
-        registered = getattr(manager, "_registered_adapters", None)
+        # vLLM's WorkerLoRAManager keeps the adapter registry on its inner
+        # LoRAModelManager (``_adapter_manager``) — ``_registered_adapters`` is not
+        # an attribute of the worker manager itself, so reading it off ``manager``
+        # returns None and makes verify report "loaded 0" even when ``add_lora``
+        # succeeded. Descend one level; fall back to ``manager`` for a layout that
+        # exposes the registry directly.
+        registry_owner = getattr(manager, "_adapter_manager", None) or manager
+        registered = getattr(registry_owner, "_registered_adapters", None)
         if registered is None:
             return {}
         lora_model = registered.get(int(adapter_id))
@@ -515,12 +522,23 @@ class BucketedIPCReceiveMixin:
         for layer_name, layer in lora_model.loras.items():
             if target is not None and layer_name not in target:
                 continue
-            per_field: dict = {}
+            # A packed module (vLLM's ``PackedLoRALayerWeights``, e.g. qkv_proj =
+            # q/k/v) stores lora_a/lora_b as a LIST of the sub-module tensors, not a
+            # single Tensor; unpacked modules (o_proj) store a single Tensor. Emit
+            # one entry per sub-tensor keyed ``<layer>#<i>`` so the multiset compare
+            # sees the same per-module hashes the trainer computed. Without this the
+            # ``isinstance(Tensor)`` guard silently skips every packed module.
+            sub: dict = {}  # suffix -> {field: hex}
             for field in ("lora_a", "lora_b", "bias", "embeddings_tensor"):
                 t = getattr(layer, field, None)
                 if isinstance(t, torch.Tensor):
-                    per_field[field] = fingerprint_tensor(t)
-            out[layer_name] = per_field
+                    sub.setdefault("", {})[field] = fingerprint_tensor(t)
+                elif isinstance(t, (list, tuple)):
+                    for i, x in enumerate(t):
+                        if isinstance(x, torch.Tensor):
+                            sub.setdefault(f"#{i}", {})[field] = fingerprint_tensor(x)
+            for suffix, per_field in sub.items():
+                out[f"{layer_name}{suffix}"] = per_field
         return out
 
 

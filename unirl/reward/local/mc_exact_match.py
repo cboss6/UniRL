@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 from unirl.reward.base import BaseRewardComponentSpec
 from unirl.types.reward import RewardRequest
 
 from .base import LocalRewardBackend
+
+_ANSWER_TAG = re.compile(r"<answer>\s*([A-D])\s*</answer>", re.IGNORECASE)
 
 _ANSWER_PATTERN = re.compile(
     r"(?:(?:answer|option)\s*(?:is|:)\s*)\(?([A-D])\)?",
@@ -51,6 +53,46 @@ def _extract_answer_letter(text: str) -> str:
     return ""
 
 
+def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
+    """Extract A/B/C/D AND a format-quality weight.
+
+    Returns ``(letter, format_weight)`` — the caller multiplies the weight in
+    only when ``letter == gt`` (a wrong answer always scores 0):
+
+      1. ``<answer>X</answer>``  → weight **1.0** (prompt-mandated format)
+      2. any other extraction    → weight **0.5** ("answer is X", a bare letter,
+         or a standalone A-D in free-form CoT)
+      no A-D letter anywhere     → ``("", 0.0)``
+
+    The full-weight ``<answer>`` tier nudges the model toward the mandated
+    format while still giving partial credit to correct-but-unformatted replies.
+    """
+    text = text.strip()
+
+    # 1. LAST <answer>X</answer> — the prompt-mandated format.
+    tag_matches = _ANSWER_TAG.findall(text)
+    if tag_matches:
+        return tag_matches[-1].upper(), 1.0
+
+    # 2. "answer is X" / "option: X" natural-language phrasing.
+    m = _ANSWER_PATTERN.search(text)
+    if m:
+        return m.group(1).upper(), 0.5
+
+    # 3a. Bare single-letter / digit reply.
+    if len(text) == 1 and text in "1234":
+        return chr(ord("A") + ord(text) - ord("1")), 0.5
+    if len(text) == 1 and text.upper() in "ABCD":
+        return text.upper(), 0.5
+
+    # 3b. Last standalone A/B/C/D anywhere in the text.
+    matches = _STANDALONE_LETTER.findall(text)
+    if matches:
+        return matches[-1].upper(), 0.5
+
+    return "", 0.0
+
+
 class MCExactMatchRewardScorer(LocalRewardBackend):
     """Multiple-choice exact-match reward for VLM QA tasks."""
 
@@ -60,6 +102,10 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "MCExactMatchSpec", base_device: str) -> None:
         del base_device
         super().__init__()
+        # Graded format reward: when True, a CORRECT answer is scored by format
+        # quality — <answer>X</answer> → 1.0, any other correct extraction → 0.5
+        # (a wrong answer is always 0.0).
+        self.graded_format_reward = bool(getattr(config, "graded_format_reward", False))
 
     def _load_model(self) -> None:
         self.model = "mc_exact_match"
@@ -75,12 +121,25 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
                 rewards.append(0.0)
                 continue
             gt = _normalize_answer(str(meta["answer"]))
-            predicted = _extract_answer_letter(text)
-            rewards.append(1.0 if predicted == gt else 0.0)
+            if self.graded_format_reward:
+                # Correct answer scored by format quality; wrong answer → 0.0.
+                predicted, fmt_weight = _extract_answer_letter_graded(text)
+                rewards.append(fmt_weight if predicted == gt else 0.0)
+            else:
+                predicted = _extract_answer_letter(text)
+                rewards.append(1.0 if predicted == gt else 0.0)
 
         return rewards
 
 
 @dataclass
 class MCExactMatchSpec(BaseRewardComponentSpec):
-    """Config for the MC exact-match scorer."""
+    """Config for the MC exact-match scorer.
+
+    ``graded_format_reward``: when True, a CORRECT answer is scored by how it was
+    formatted — ``<answer>X</answer>`` → 1.0, any other correct extraction → 0.5;
+    a wrong answer is always 0.0. Keeps a positive-but-smaller signal for
+    correct-yet-unformatted replies instead of the hard 1/0 exact match.
+    """
+
+    graded_format_reward: bool = False

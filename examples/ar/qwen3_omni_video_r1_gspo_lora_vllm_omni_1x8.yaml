@@ -1,0 +1,223 @@
+# @package _global_
+# Qwen3-Omni Thinker · GSPO + LoRA · video MCQA · vLLM-Omni rollout · Video-R1-260k.
+#
+# The rollout engine is anchored to a single Worker actor (TP=4, 4 GPUs) while
+# training runs FSDP DP=8 across all 8 GPUs; sleep/wake time-shares the 4 rollout
+# cards with training (the base is offloaded to CPU while the engine is awake).
+#
+# TP is 4, not 8: the Qwen3-Omni thinker's audio tower has 20 attention heads
+# (loaded even with ``use_audio_in_video: false``), and TP must divide 20 →
+# TP ∈ {1, 2, 4, 5}.
+#
+# Launch (from repo root, model on /dev/shm):
+#   bash run_vllm_omni.sh
+#   # or directly:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#   QWEN3_OMNI_PATH=/dev/shm/Qwen3-Omni-30B-A3B-Instruct \
+#   DATA_PATH=datasets/video_r1_260k/train.jsonl \
+#   EVAL_DATA_PATH=datasets/video_r1_260k/val.jsonl \
+#   PYTHONPATH=$(pwd) \
+#   python -m unirl.train_ar --config-name=ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
+
+num_devices: 8
+devices_per_node: 8
+batch_size: 8
+
+num_rollouts: 500
+weight_sync_interval: 1
+
+adv_normalization_scope: group
+
+eval_interval: 20
+eval_num_prompts: 8
+eval_samples_per_prompt: 1
+eval_temperature: 1.0
+
+# Anchor the rollout engine to device 1 (offset from device 0 to avoid a
+# RemoteLoraWeightSync.push self-deadlock: rank 0 raw-ray-calls the anchor
+# rollout; if the anchor were rank 0 the push would queue behind itself).
+rollout_anchor_device: 1
+# Drive the colocate dance: before every rollout the WHOLE training model (frozen
+# base + audio_tower/visual + LoRA adapters, plus grads / optimizer state) is sent
+# to CPU and the caching allocator is emptied, so vllm-omni's TP workers boot with
+# enough free GPU to satisfy their ``gpu_memory_utilization * total`` floor; it is
+# onloaded back before backward. FSDP2 ``fully_shard`` owns SHARDING only (never
+# CPU<->GPU placement); this manual offload/onload is the SOLE owner of CPU<->GPU
+# placement and moves EVERY param (see ``cpu_offload: false`` below). The two axes
+# are orthogonal, so the two owners never fight.
+enable_fsdp_offload: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-qwen3-omni
+  run_name: qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [gspo, qwen3-omni, thinker, video, vllm-omni, lora, video-r1-260k, 1x8]
+
+bundle:
+  _target_: unirl.models.qwen3_omni.bundle.Qwen3OmniBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,/dev/shm/Qwen3-Omni-30B-A3B-Instruct}
+    model_precision: bf16
+    attn_implementation: sdpa
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 12288
+    video_fps: 1.0
+    video_max_pixels: 262144
+    use_audio_in_video: false
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
+  max_prompt_length: 12288
+  video_fps: 1.0
+  video_max_pixels: 262144
+  use_audio_in_video: false
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeThinkerTextDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    # false: FSDP2 manages SHARDING only, never CPU<->GPU placement — that is owned
+    # entirely by the manual offload/onload dance (enable_fsdp_offload above).
+    # Setting this true adds FSDP's own CPUOffloadPolicy as a SECOND placement
+    # owner whose invariant then fires the moment the manual onload puts a sharded
+    # param back on GPU — the two cannot coexist.
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 500
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    # q/k/v/o_proj also name the audio_tower's attention Linears; peft injects a
+    # TRAINABLE LoRA onto every name match regardless of ``freeze_audio_tower``
+    # (peft doesn't consult requires_grad). Excluding them keeps the frozen
+    # encoders truly frozen — with use_audio_in_video:false the audio path is
+    # unused, so adapting there is pure waste and contradicts the freeze intent.
+    exclude_modules: ".*visual.*|.*audio_tower.*"
+
+# Rollout: vLLM-Omni Omni orchestrator (Qwen3-Omni thinker, single AR stage, LoRA).
+# TP=4 across 4 physical cards (runtime.devices="0,1,2,3" in the stage yaml); the
+# audio tower's 20 attention heads force TP ∈ {1,2,4,5}. Sleep/wake time-shares
+# those 4 cards with training. ``clear_cuda_visible=True`` (set on the adapter
+# class) pops the Ray-injected CVD so the vllm-omni subprocess sees all 8 host GPUs
+# and pins its 4 TP workers to the runtime.devices list.
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:QWEN3_OMNI_PATH,/dev/shm/Qwen3-Omni-30B-A3B-Instruct}
+    modality: qwen3_omni_thinker
+    stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml   # TP=4 (audio tower 20 heads)
+    enable_sleep_mode: true
+    omni_extra:
+      stage_init_timeout: 1200
+      init_timeout: 1800
+
+# LoRA weight sync: RemoteLoraWeightSync — the anchor rollout is not a sibling of
+# most train ranks, so extract runs BROADCAST on all train ranks then rank 0 raw-
+# ray-pushes. copy=true routes through the byte-copy receiver (TP>1 zero-copy
+# handles crash ranks 2..N; the adapter's ``lora_copy_transport = True`` documents
+# the same reason).
+sync:
+  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
+  # Qwen3-Omni thinker loads standalone with base_model_prefix="thinker", so HF
+  # strips the "thinker." prefix and the trained LoRA keys are "model.layers.…".
+  # vLLM-Omni's thinker LoRA mapper only maps "thinker.model." → "language_model.
+  # model."; keys lacking "thinker." resolve to 0 vLLM modules → the engine loads 0
+  # loras and rollout silently runs BASE weights. Re-add "thinker." so the mapper
+  # resolves the real language_model.model.* modules (validated by sync.verify).
+  param_prefix: "thinker."
+  adapter_name: default
+  # Post-load checksum read-back (vLLM-Omni only): compares the trained per-module
+  # lora_A/lora_B hashes against what the engine actually loaded, each sync. It is
+  # packing-aware (unpacks vLLM's qkv_proj PackedLoRALayerWeights), so it catches a
+  # silent 0-lora load (which would run base weights and blow up the k3 metric).
+  verify: true
+  copy: true
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # DAPO overlong shaping: a graded negative penalty over the last
+  # overlong_buffer_len tokens of the max_new_tokens window (reaching
+  # -overlong_penalty_factor at the hard cap). Qwen3-Omni's CoT often runs long
+  # without emitting <answer>; this penalizes runaway CoT smoothly instead of a
+  # hard zero.
+  truncated_reward: soft
+  overlong_buffer_len: 512
+  overlong_penalty_factor: 1.0
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+      # Graded format reward (correct answer only; a wrong answer is always 0):
+      #   <answer>X</answer> → 1.0 ; any other correct extraction → 0.5.
+      # Keeps a positive-but-smaller signal for correct-yet-unformatted replies
+      # while steering the model toward the mandated <answer> tag.
+      graded_format_reward: true
+
+algorithm:
+  _target_: unirl.algorithms.gspo.GSPO
+  stage_attr: ar
+  clip_range: 3.0e-4
+  clip_range_high: 4.0e-4
+  clip_schedule: constant
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/video_r1_260k/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/video_r1_260k/val.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 8
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192

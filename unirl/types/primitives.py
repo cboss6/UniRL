@@ -207,6 +207,15 @@ class Videos(Batch):
 
     frames: torch.Tensor = field(kind=FieldKind.PACKED, default=None)
 
+    # Optional per-sample video SOURCE paths (one URI per sample, batch-aligned).
+    # Some multimodal processors (Qwen3-Omni) must receive the raw video file and
+    # sample frames themselves (fps-driven) to derive video_grid_thw /
+    # second_per_grid consistently with their TMRoPE — pre-decoding into ``frames``
+    # would bypass that. ``uris`` carries the source path for that path; it is
+    # CONCAT (per-sample) so cross-worker concat / slice stay aligned with the
+    # other batch fields. ``frames`` and ``uris`` are mutually exclusive per batch.
+    uris: Optional[List[str]] = concat_field(default=None)
+
     @property
     def cu_frames(self) -> Optional[torch.Tensor]:
         """Per-sample cumulative frame offsets — alias for :attr:`cu_seqlens`.
@@ -248,6 +257,17 @@ class Videos(Batch):
         # attaches ``_packed_cu_seqlens``. ``pack`` ``torch.cat``s the
         # per-sample frames along dim 0 internally.
         return cls.pack(frames=frames_list)
+
+    @classmethod
+    def from_uris(cls, uris: List[str]) -> "Videos":
+        """Build a frame-less ``Videos`` carrying per-sample source paths.
+
+        For processors that load + sample the video themselves (Qwen3-Omni).
+        ``frames`` stays ``None``; ``uris`` is a batch-aligned per-sample list.
+        """
+        if not uris:
+            raise ValueError("Cannot build Videos from an empty uris list")
+        return cls(uris=list(uris))
 
     def to_list(self) -> List[Video]:
         cu = self.cu_seqlens

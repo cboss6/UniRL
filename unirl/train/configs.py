@@ -12,6 +12,13 @@ class LoraConfig:
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
+    # peft module-path regex of layers to EXCLUDE from adapter injection, even
+    # when their name matches target_modules. Needed because peft injects a
+    # (trainable) LoRA adapter onto every name-matched Linear regardless of the
+    # base layer's requires_grad — so a bare requires_grad_(False) freeze does
+    # NOT keep an encoder cold if its Linear names collide with target_modules
+    # (Qwen3-Omni's audio_tower reuses q/k/v_proj). None = inject on every match.
+    exclude_modules: Optional[str] = None
 
 
 @dataclass

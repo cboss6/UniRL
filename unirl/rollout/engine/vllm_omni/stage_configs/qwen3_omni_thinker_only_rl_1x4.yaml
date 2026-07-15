@@ -1,0 +1,48 @@
+# Thinker-only stage config for Qwen3-Omni RL training with vllm-omni — 4-GPU / TP=4.
+#
+# See qwen3_omni_thinker_only_rl.yaml for the 8-GPU / TP=8 variant. The only
+# fields that differ from the 8-GPU file are ``devices`` and
+# ``tensor_parallel_size``.
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: thinker
+      model_arch: Qwen3OmniMoeThinkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      engine_output_type: text
+      hf_config_name: thinker_config
+
+      tensor_parallel_size: 4
+      distributed_executor_backend: "mp"
+
+      gpu_memory_utilization: 0.4
+      max_num_seqs: 64
+      max_num_batched_tokens: 32768
+      enable_chunked_prefill: true
+
+      dtype: bfloat16
+      load_format: safetensors
+      trust_remote_code: true
+      enable_prefix_caching: false
+      enforce_eager: true
+
+      enable_lora: true
+      max_lora_rank: 64
+      max_loras: 1
+
+      # Compose the weight-sync receive extension onto the AR worker (GPUARWorker)
+      # so it exposes set_lora_from_tensor_dict[_copy] + update_weights_from_ipc
+      # that the trainer's RemoteLoraWeightSync.push targets. Without it the push
+      # raises "'GPUARWorker' object has no attribute 'set_lora_from_tensor_dict_copy'"
+      # and rollout falls back to a nonexistent on-disk adapter load.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.qwen3_omni_ar_extension.Qwen3OmniARWeightSyncExtension
+
+      enable_sleep_mode: true
+      logprobs_mode: processed_logprobs
+      disable_log_stats: true
+    final_output: true
+    final_output_type: text
+    is_comprehension: true

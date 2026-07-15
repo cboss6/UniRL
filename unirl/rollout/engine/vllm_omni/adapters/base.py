@@ -168,6 +168,15 @@ class ModelAdapter(ABC):
 
     # ---- construction-time validation (v1 engine.py:404-409) ----
     def validate(self) -> None:
+        # ``shift`` only matters when the adapter builds a diffusion schedule
+        # policy (``needs_sigmas``). AR-only modalities (e.g. Qwen3-Omni
+        # thinker) don't carry it — asserting unconditionally would refuse
+        # any AR-only ``model_config``. HI3's AR-only adapters (``hi3_t2t`` /
+        # ``hi3_ar_recaption``) happen to pass because their model config
+        # still carries ``shift``, but that's coincidence — the guard belongs
+        # on ``needs_sigmas``.
+        if not self.needs_sigmas:
+            return
         mc = self.model_config
         require(
             mc is not None and hasattr(mc, "shift"),

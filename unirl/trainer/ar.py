@@ -58,6 +58,8 @@ class ARTrainer(BaseTrainer):
         eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
+        rollout_anchor_device: Optional[int] = None,
+        enable_fsdp_offload: bool = True,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -89,6 +91,24 @@ class ARTrainer(BaseTrainer):
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
 
+        # Anchored single-actor rollout topology.
+        # None (default) → SPMD ``remote()`` scatter: the rollout engine is
+        # replicated to every train rank's slot0 worker; each rank drives its own
+        # TP=1 rollout replica (sglang / trainside). Works for models that fit a
+        # single card unshard.
+        # int k → anchor the rollout engine to device k's slot0 worker only. Enables
+        # TP>1 (vllm-omni's mp_executor spawns its own TP workers under this single
+        # driver). Requires adapter ``clear_cuda_visible=True`` and
+        # ``RemoteLoraWeightSync``; ``train_step`` runs a colocate memory dance
+        # around every rollout to time-share the physical cards.
+        self._rollout_anchor_device: Optional[int] = (
+            int(rollout_anchor_device) if rollout_anchor_device is not None else None
+        )
+        # Whether to offload the FSDP base to CPU while the rollout engine is
+        # awake. Meaningful only when ``_rollout_anchor_device is not None`` — the
+        # SPMD path shares the module with the rollout so offload is off.
+        self._enable_fsdp_offload = bool(enable_fsdp_offload)
+
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
@@ -102,18 +122,57 @@ class ARTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
-            else:
-                self.rollout = remote(**rollout_parsed)  # for vllm / sglang
-
             self.reward = remote_hydra(reward_cfg)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+            rollout_parsed = parse_hydra_cfg(rollout_cfg)
+            if self._rollout_anchor_device is None:
+                # SPMD path (default): rollout scattered to every rank's slot0,
+                # constructed alongside the other roles.
+                if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+                else:
+                    self.rollout = remote(**rollout_parsed)  # for vllm / sglang TP=1
+                if sync_cfg is not None:
+                    # SPMD sibling engine → LocalLoraWeightSync (in-process copy).
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+            else:
+                # Anchored boot dance (kept inside this ``with placement`` scope
+                # because ``remote_hydra(sync_cfg, ...)`` needs an active placement
+                # scope to resolve):
+                #   1. Offload the FSDP base to CPU so the anchored vllm-omni
+                #      engine's TP workers boot with enough free GPU to pass the
+                #      ``gpu_memory_utilization * total`` check (an ~8 GiB/card
+                #      shard + activations otherwise leaves too little free).
+                #   2. Anchor the rollout engine to ``rollout_anchor_device``; TP>1
+                #      (vllm-omni thinker TP=4) lives inside that one Worker actor's
+                #      spawn subtree.
+                #   3. Sleep the engine (steady state on entry to train_step).
+                #   4. Build RemoteLoraWeightSync (backend-only, no rollout sibling)
+                #      and bind the rollout Workers explicitly.
+                # offload() moves the WHOLE model (frozen base + adapters) to CPU:
+                # with cpu_offload=False the manual dance is the sole owner of
+                # CPU<->GPU placement, so it must vacate everything to free the cards.
+                if self._enable_fsdp_offload:
+                    self.backend.offload()
+
+                role_cls = rollout_parsed.pop("role_cls")
+                self.rollout = self.pool.create_remote(
+                    role_cls,
+                    device_ids=[self._rollout_anchor_device],
+                    init_kwargs=rollout_parsed,
+                )
+                self.rollout.sleep()
+
+                if sync_cfg is not None:
+                    # The anchored engine is NOT a same-Worker sibling of most
+                    # train ranks, so pass only ``backend=`` (not ``rollout=``);
+                    # ``set_rollout_targets`` binds the rollout Workers explicitly.
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+                    self.weight_sync.set_rollout_targets(
+                        [(self.rollout.role_name, self.rollout.workers)]
+                    )
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
@@ -149,11 +208,44 @@ class ARTrainer(BaseTrainer):
         ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        self.rollout.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
-        resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        if self._rollout_anchor_device is None:
+            # SPMD path: rollout sibling of every train rank; sync + generate + sleep in-place.
+            self.rollout.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.sync()
+            resp = self.rollout.generate(req)
+            self.rollout.sleep()
+        else:
+            # Anchored colocate memory dance. Entry state: base offloaded to CPU,
+            # rollout asleep.
+            #   1. Onload base, extract adapter (FSDP state_dict), re-offload base.
+            #   2. Wake rollout.
+            #   3. Push the adapter from rank 0 to the anchored rollout worker.
+            #   4. Generate (rollout occupies its physical cards via the stage yaml).
+            #   5. Sleep rollout, onload base for backward.
+            # The manual dance moves the WHOLE model (cpu_offload=False → it is the
+            # sole owner of CPU<->GPU placement); ``torch.cuda.empty_cache()`` inside
+            # backend.offload() returns freed blocks so the vllm-omni process sees them.
+            if sync_weights and self.weight_sync is not None:
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
+                self.weight_sync.extract()
+                if self._enable_fsdp_offload:
+                    self.backend.offload()
+            self.rollout.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.push()
+            resp = self.rollout.generate(req)
+            # The anchored rollout returns a single TensorRef spanning the whole
+            # batch; SPMD downstream (reward.score_and_attach / stack.train_track,
+            # both DP_SCATTER) needs real tensors so the dispatch can slice dim 0
+            # per-rank. The driver has no TensorTransportRuntime, so hydrate here.
+            from unirl.trainer.unified_model import deep_hydrate
+
+            resp = deep_hydrate(resp)
+            self.rollout.sleep()
+            if self._enable_fsdp_offload:
+                self.backend.onload()
 
         for name, track in list(resp.tracks.items()):
             if track.segment is not None:
@@ -220,10 +312,26 @@ class ARTrainer(BaseTrainer):
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
-        self.rollout.wake_up()
-        try:
+        anchored = self._rollout_anchor_device is not None
+
+        # Anchored intro: extract → offload base → wake rollout → push. SPMD path:
+        # just wake + (optional) sync. The manual dance moves the WHOLE model
+        # (cpu_offload=False, sole owner of CPU<->GPU placement) so the rollout fits.
+        if anchored:
+            if self.weight_sync is not None:
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
+                self.weight_sync.extract()
+                if self._enable_fsdp_offload:
+                    self.backend.offload()
+            self.rollout.wake_up()
+            if self.weight_sync is not None:
+                self.weight_sync.push()
+        else:
+            self.rollout.wake_up()
             if self.weight_sync is not None:
                 self.weight_sync.sync()
+        try:
             for eval_inputs in eval_batches:
                 batch_n += 1
                 prompt_n += len(eval_inputs.sample_ids)
@@ -237,6 +345,12 @@ class ARTrainer(BaseTrainer):
                     metadata=list(inputs.metadata) if inputs.metadata else [],
                 )
                 resp = self.rollout.generate(req)
+                if anchored:
+                    # Anchored rollout returns a single driver-side TensorRef;
+                    # downstream reward scoring (DP_SCATTER) needs real tensors.
+                    from unirl.trainer.unified_model import deep_hydrate
+
+                    resp = deep_hydrate(resp)
                 for track in resp.tracks.values():
                     if track.segment is not None:
                         track = self.reward.score_and_attach(req=req, track=track)
@@ -247,6 +361,10 @@ class ARTrainer(BaseTrainer):
                         break  # single-track for now; revisit if multi-track lands
         finally:
             self.rollout.sleep()
+            # Anchored outro: onload base back to GPU so the next train_step's
+            # backward has params on-device (base was offloaded in the intro).
+            if anchored and self._enable_fsdp_offload:
+                self.backend.onload()
 
         acc = reward_sum / max(1, reward_n)
         logger.info(

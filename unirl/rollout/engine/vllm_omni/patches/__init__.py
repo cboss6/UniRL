@@ -56,9 +56,14 @@ def install() -> None:
     Lazy: importing this package stays CPU-safe; the runtime import happens
     here, at the spawn boundary.
     """
+    from unirl.rollout.engine.vllm_omni.patches import qwen3_omni as _qwen3_omni
     from unirl.rollout.engine.vllm_omni.patches.runtime import VLLMOmniHijack
 
     VLLMOmniHijack.hijack()
+
+    # Model-specific patches — AutoModelForCausalLM registration + verl
+    # tokenizer/processor extensions. Idempotent; safe to re-run in workers.
+    _qwen3_omni.apply()
 
 
 def __getattr__(name: str):

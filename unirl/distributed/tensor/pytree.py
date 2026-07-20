@@ -6,6 +6,13 @@ pair). Both recurse over the same node types (``Tensor`` / ``ndarray`` /
 ``list`` / ``tuple`` / ``dict`` / ``Batch`` / ``TensorRef``) and operate
 along axis 0.
 
+``pytree_hydrate`` walks the same node types and materializes every
+``TensorRef`` leaf to a real tensor — driver-side companion for an anchored
+rollout engine that returns a single ref spanning the whole batch (DP dispatch
+downstream can only intra-slice REAL tensors). Response is a structural no-op
+when there are no ``TensorRef`` leaves (SPMD engines that already scatter),
+so trainers can call it unconditionally without a backend if-branch.
+
 ``infer_batch_size`` is the companion that derives the ``batch_size`` argument
 ``pytree_chunk`` splits along: it walks an ``args`` / ``kwargs`` payload and
 returns the first batch-axis size found (``Broadcast``-wrapped values opt out).
@@ -18,6 +25,7 @@ it encounters a ``Batch`` node.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
 
 import numpy as np
@@ -25,7 +33,7 @@ import torch
 
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 from unirl.distributed.tensor.batch import Batch
-from unirl.distributed.tensor.ref import TensorRef
+from unirl.distributed.tensor.ref import TensorRef, hydrate
 from unirl.distributed.utils import Broadcast
 
 # ── Batch-size inference ──
@@ -218,4 +226,63 @@ def pytree_cat(results: list) -> Any:
         return first
 
 
-__all__ = ["infer_batch_size", "pytree_cat", "pytree_chunk"]
+__all__ = ["infer_batch_size", "pytree_cat", "pytree_chunk", "pytree_hydrate"]
+
+
+# ── Driver-side ref hydration (anchored-engine companion) ──
+
+
+def pytree_hydrate(obj: Any) -> Any:
+    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place.
+
+    Companion of :func:`pytree_chunk` / :func:`pytree_cat` on the anchored-engine
+    return path: an engine that runs as ONE actor (TP-parallel inside) returns
+    each track as a single transport handle (one ``TensorRef`` spanning all
+    samples). The train side is num_devices-way DP and slices each track into
+    per-rank shards — a single ref cannot be intra-handle sliced. Hydrate here
+    on the driver so downstream ``DP_SCATTER`` dispatches real tensors.
+
+    Node classification mirrors ``pytree_chunk`` / ``pytree_cat``:
+
+    - ``TensorRef``               → ``hydrate(...)`` to a real tensor
+    - ``Batch``                   → walk fields in place (rebuild not needed)
+    - ``dict``                    → walk values in place
+    - ``list``                    → walk in place
+    - ``tuple``                   → return a rebuilt tuple (immutable)
+    - anything else               → returned as-is (no-op)
+
+    Structural no-op when there are no ``TensorRef`` leaves (SPMD engines that
+    already emit per-rank real tensors), so callers can invoke it uniformly
+    without a backend if-branch.
+
+    NB: walks tuples too (unlike ``_collect_leaves``); HunyuanImage3's fused
+    condition stores ``rope_cache`` as a ``tuple`` of two ``TensorRef``, and
+    the DP scatter's driver-side ``RolloutTrack.concat`` pads that rope
+    (``conditions.concat`` → ``_pad_seq`` → ``t.ndim``), so the rope MUST be
+    real tensors here.
+
+    Driver-only: uses ``TensorRef.materialize(backend=None)`` (plain ``ray.get``
+    from the owning worker's store); the runtime-backed ``TensorTransport``
+    path requires a ``TensorTransportRuntime`` install that the driver lacks.
+    """
+    if isinstance(obj, TensorRef):
+        return hydrate(obj)
+    if isinstance(obj, Batch):
+        for f in dataclasses.fields(obj):
+            v = getattr(obj, f.name)
+            if v is not None:
+                new = pytree_hydrate(v)
+                if new is not v:
+                    setattr(obj, f.name, new)
+        return obj
+    if isinstance(obj, dict):
+        for k in list(obj.keys()):
+            obj[k] = pytree_hydrate(obj[k])
+        return obj
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            obj[i] = pytree_hydrate(obj[i])
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(pytree_hydrate(x) for x in obj)
+    return obj

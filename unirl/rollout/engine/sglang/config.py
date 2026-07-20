@@ -197,6 +197,18 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.top_p must be in (0, 1]; got {self.top_p!r}",
         )
 
+    # ------------------------------------------------------------------
+    # rollout_world_size — cards ONE engine actor occupies (TP × PP × DP,
+    # verl llm_server.py:417 formula). Trainer uses it to derive
+    # ``num_replicas = total_gpus // rollout_world_size``. SGLang exposes
+    # only ``tp_size`` today; when PP / DP become configurable, wire them
+    # in here (this is the single external accessor).
+    # ------------------------------------------------------------------
+
+    @property
+    def rollout_world_size(self) -> int:
+        return int(self.tp_size or 1)
+
         self.backend = str(self.backend).strip().lower()
         require(
             self.backend in ("http", "native"),

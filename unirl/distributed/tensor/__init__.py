@@ -12,6 +12,12 @@ from unirl.distributed.tensor.batch import (
     shared_field,
     sum_field,
 )
+from unirl.distributed.tensor.pytree import (
+    infer_batch_size,
+    pytree_cat,
+    pytree_chunk,
+    pytree_hydrate,
+)
 from unirl.distributed.tensor.ref import (
     TensorHandle,
     TensorRef,
@@ -41,11 +47,15 @@ __all__ = [
     "concat_field",
     "field",
     "hydrate",
+    "infer_batch_size",
     "map_tree",
     "max_field",
     "mean_field",
     "min_field",
     "packed_field",
+    "pytree_cat",
+    "pytree_chunk",
+    "pytree_hydrate",
     "shared_field",
     "sum_field",
 ]

@@ -44,6 +44,12 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     _component_name = "vllm_omni"
 
+    # vLLM-Omni's Qwen3-Omni AR extension exposes ``loaded_lora_checksums``
+    # (see ``worker/qwen3_omni_ar_extension.py``), so the post-load LoRA
+    # sync ``verify`` read-back can run. SGLang does NOT — see its base
+    # engine capability flag comment.
+    supports_lora_checksum: bool = True
+
     def __init__(
         self,
         config: VLLMOmniEngineConfig,

@@ -87,6 +87,42 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         )
 
     # ------------------------------------------------------------------
+    # rollout_world_size — cards ONE engine actor occupies (TP × PP × DP,
+    # verl's llm_server.py:417 formula). The trainer uses this to derive
+    # ``num_replicas = total_gpus // rollout_world_size`` (verl's placement
+    # rule), so all callers converge on ONE number regardless of backend.
+    # For vLLM-Omni the value is not on ``VLLMOmniEngineConfig`` itself — the
+    # runtime reads it out of the stage YAML's ``engine_args.tensor_parallel_size``
+    # (× ``pipeline_parallel_size`` when present). We parse that here so users
+    # keep spelling TP in the SSOT (the stage YAML) and do not duplicate it.
+    # ------------------------------------------------------------------
+
+    @property
+    def rollout_world_size(self) -> int:
+        """Number of GPUs one engine actor occupies.
+
+        Reads ``tensor_parallel_size`` (× ``pipeline_parallel_size``) out of the
+        stage YAML referenced by ``stage_yaml_override``, or the adapter's
+        default ``stage_yaml`` when the recipe did not override (or when
+        ``stage_yaml_override`` is not exposed on this config version yet).
+        Falls back to ``1`` if the yaml has no such key.
+        """
+        from unirl.rollout.engine.vllm_omni.adapters import get_adapter
+
+        # Prefer the recipe-level override; else the adapter class's default.
+        # ``getattr`` (not attribute access) so this works on older config
+        # versions that predate the ``stage_yaml_override`` field.
+        adapter_cls = get_adapter(self.modality)
+        stage_yaml = (
+            getattr(self, "stage_yaml_override", None)
+            or getattr(adapter_cls, "stage_yaml", "")
+            or ""
+        )
+        if not stage_yaml:
+            return 1
+        return _parse_stage_yaml_world_size(stage_yaml)
+
+    # ------------------------------------------------------------------
     # Boot intent (consumed by ``VLLMOmniBackend.boot``)
     # ------------------------------------------------------------------
 
@@ -140,3 +176,40 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
 
 __all__ = ["VLLMOmniPorts", "VLLMOmniEngineConfig"]
+
+
+# ---------------------------------------------------------------------------
+# Stage-YAML parsing (engine world-size read-out)
+# ---------------------------------------------------------------------------
+
+
+def _parse_stage_yaml_world_size(stage_yaml: str) -> int:
+    """Return ``tensor_parallel_size × pipeline_parallel_size`` from a stage YAML.
+
+    Mirrors vllm-omni's ``load_stage_configs_from_yaml`` lookup path: the yaml
+    lives beside ``unirl/rollout/engine/vllm_omni/stage_configs/`` (source
+    ``"local"``). We only need the first stage's ``engine_args``; every stage in
+    a UniRL stage yaml today runs the same TP (verified across all yamls under
+    ``stage_configs/``). Falls back to ``1`` on any parse miss.
+    """
+    import os as _os
+
+    import yaml as _yaml
+
+    # The stage yaml file lives at unirl/rollout/engine/vllm_omni/stage_configs/<name>.
+    cfg_dir = _os.path.join(_os.path.dirname(__file__), "stage_configs")
+    path = stage_yaml if _os.path.isabs(stage_yaml) else _os.path.join(cfg_dir, stage_yaml)
+    if not _os.path.isfile(path):
+        return 1
+    try:
+        with open(path) as fh:
+            doc = _yaml.safe_load(fh) or {}
+    except Exception:  # pragma: no cover — parse failure → conservative 1
+        return 1
+    stages = doc.get("stage_args") or doc.get("stage_configs") or []
+    if not stages:
+        return 1
+    engine_args = ((stages[0] or {}).get("engine_args")) or {}
+    tp = int(engine_args.get("tensor_parallel_size") or 1)
+    pp = int(engine_args.get("pipeline_parallel_size") or 1)
+    return max(1, tp * pp)

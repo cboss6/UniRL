@@ -41,9 +41,31 @@ class BaseEngineConfig(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} must implement make_engine()")
 
+    @property
+    def rollout_world_size(self) -> int:
+        """Number of GPUs a single engine actor occupies.
+
+        Verl's placement formula (``verl/workers/rollout/llm_server.py:417``)
+        computes ``num_replicas = total_gpus // rollout_world_size``. Subclasses
+        override to spell their own placement: SGLang → ``tp_size``; vLLM-Omni
+        → parsed out of the stage YAML's ``tensor_parallel_size``. Default 1
+        (single-card / trainside engines, matches the pre-formula behaviour).
+        """
+        return 1
+
 
 class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC. One-shot construction; new types only."""
+
+    # ------------------------------------------------------------------
+    # Backend capability flags (self-declared)
+    # ------------------------------------------------------------------
+    #: Whether this engine implements ``loaded_lora_checksums`` for the
+    #: post-load LoRA sync ``verify`` read-back. vLLM-Omni: True; SGLang:
+    #: False (no such interface). Consumers (``wire_colocated_weight_sync``)
+    #: use this to fail-loud when a recipe pairs ``verify=True`` with an
+    #: engine that cannot answer.
+    supports_lora_checksum: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle

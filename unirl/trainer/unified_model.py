@@ -64,7 +64,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import TensorRef, hydrate
+from unirl.distributed.tensor import TensorRef, hydrate, pytree_hydrate
 from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -86,47 +86,19 @@ IMAGE_TRACK = "image"
 
 
 def deep_hydrate(obj: Any) -> Any:
-    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place.
+    """Historical alias for :func:`unirl.distributed.tensor.pytree_hydrate`.
 
-    The anchored single-actor engines return each track as ONE transport handle
-    (a single ref spanning all samples), but the train side is num_devices-way DP and
-    slices each track into per-rank shards — a single ref can't be intra-handle
-    sliced. Hydrating on the driver fixes the mismatch (the DP dispatch then
-    re-shards real tensors), but the driver has no ``TensorTransportRuntime``
-    installed, so the runtime-backed ``TensorTransport.hydrate`` is
-    unavailable here. ``hydrate`` instead pulls each leaf through
-    its ref's ``.materialize(backend=None)`` (a plain ``ray.get`` from the owning worker's store),
-    which works from the driver — we walk the nested Batch/dict/list/TUPLE
-    structure and apply it to every ``TensorRef``.
+    Kept as a thin re-export so callers of
+    ``unirl.trainer.unified_model.deep_hydrate`` keep working; new code should
+    import ``pytree_hydrate`` from ``unirl.distributed.tensor`` directly.
 
-    NB: this walks TUPLES too (rebuilding them), unlike ``_collect_leaves``
-    which skips them. HunyuanImage3's fused condition stores ``rope_cache`` as a
-    ``tuple`` of two TensorRef; the DP scatter's driver-side
-    ``RolloutTrack.concat`` pads that rope (``conditions.concat`` → ``_pad_seq``
-    → ``t.ndim``), so the rope MUST be real tensors here. (dp=1 never concats on
-    the driver, so it never tripped on this.)
+    Why hydrate on the driver at all: the anchored single-actor engines return
+    each track as ONE transport handle (a single ref spanning all samples),
+    but the train side is num_devices-way DP and slices each track into
+    per-rank shards — a single ref cannot be intra-handle sliced. Hydrating on
+    the driver fixes the mismatch (DP dispatch then re-shards real tensors).
     """
-    if isinstance(obj, TensorRef):
-        return hydrate(obj)
-    if isinstance(obj, Batch):
-        for f in dataclasses.fields(obj):
-            v = getattr(obj, f.name)
-            if v is not None:
-                new = deep_hydrate(v)
-                if new is not v:
-                    setattr(obj, f.name, new)
-        return obj
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            obj[k] = deep_hydrate(obj[k])
-        return obj
-    if isinstance(obj, list):
-        for i in range(len(obj)):
-            obj[i] = deep_hydrate(obj[i])
-        return obj
-    if isinstance(obj, tuple):
-        return tuple(deep_hydrate(x) for x in obj)
-    return obj
+    return pytree_hydrate(obj)
 
 
 class UnifiedModelTrainer(BaseTrainer):

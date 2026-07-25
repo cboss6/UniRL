@@ -191,6 +191,68 @@ def _patch_hf_tokenizer_for_qwen3_omni() -> None:
             mod.hf_tokenizer = _patched_hf_tokenizer
 
 
+def _patch_vllm_audio_truncation_lengths() -> None:
+    """Keep vLLM's audio lengths aligned with truncated HF features.
+
+    vLLM-Omni moves the top-level ``truncation`` flag into ``audio_kwargs``
+    before calling Transformers, but then checks the now-missing top-level flag
+    while reconstructing ``audio_feature_lengths``. For audio just over the
+    Whisper 30-second window this reports 3001 frames for a 3000-frame feature
+    tensor, producing one extra audio placeholder.
+    """
+    try:
+        import torch
+        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+            Qwen3OmniMoeThinkerMultiModalProcessor as Processor,
+        )
+    except ImportError:
+        return
+    if getattr(Processor, "_unirl_audio_truncation_lengths_patched", False):
+        return
+
+    original = Processor._call_hf_processor
+
+    def call_hf_processor(
+        self: Any,
+        prompt: Any,
+        mm_data: Any,
+        mm_kwargs: Any,
+        tok_kwargs: Any,
+    ) -> Any:
+        outputs = original(
+            self,
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
+        audio_kwargs = mm_kwargs.get("audio_kwargs") or {}
+        truncation = bool(mm_kwargs.get("truncation", audio_kwargs.get("truncation", False)))
+        lengths = outputs.get("audio_feature_lengths")
+        if not truncation or lengths is None:
+            return outputs
+
+        feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
+        max_frames = int(feature_extractor.n_samples // feature_extractor.hop_length)
+        lengths_tensor = torch.as_tensor(lengths).clamp_max(max_frames)
+        outputs["audio_feature_lengths"] = lengths_tensor
+        old_mask = outputs.get("feature_attention_mask")
+        if isinstance(old_mask, list):
+            outputs["feature_attention_mask"] = [
+                torch.ones(int(length), dtype=mask.dtype if isinstance(mask, torch.Tensor) else torch.float32)
+                for length, mask in zip(lengths_tensor.tolist(), old_mask)
+            ]
+        elif isinstance(old_mask, torch.Tensor):
+            positions = torch.arange(max_frames, device=old_mask.device)
+            outputs["feature_attention_mask"] = (
+                positions.unsqueeze(0) < lengths_tensor.to(old_mask.device).unsqueeze(1)
+            ).to(old_mask.dtype)
+        return outputs
+
+    Processor._call_hf_processor = call_hf_processor
+    Processor._unirl_audio_truncation_lengths_patched = True
+
+
 def apply() -> None:
     """Apply all Qwen3-Omni patches once."""
     global _APPLIED
@@ -199,6 +261,7 @@ def apply() -> None:
     _register_qwen3_omni_automodel()
     _patch_hf_processor_for_qwen3_omni()
     _patch_hf_tokenizer_for_qwen3_omni()
+    _patch_vllm_audio_truncation_lengths()
     _APPLIED = True
 
 

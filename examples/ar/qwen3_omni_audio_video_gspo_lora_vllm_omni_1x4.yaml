@@ -23,8 +23,8 @@ weight_sync_interval: 1
 
 adv_normalization_scope: group
 
-eval_interval: 10
-eval_num_prompts: 100
+eval_interval: 5
+eval_num_prompts: -1
 eval_samples_per_prompt: 1
 eval_temperature: 1.0
 
@@ -122,6 +122,9 @@ rollout:
     stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml   # TP=4 (audio tower 20 heads)
     enable_sleep_mode: true
     max_prompt_length: 16384
+    video_fps: 2.0
+    video_max_pixels: 262144
+    use_audio_in_video: true
     omni_extra:
       stage_init_timeout: 1200
       init_timeout: 1800
@@ -151,18 +154,13 @@ reward:
 algorithm:
   _target_: unirl.algorithms.gspo.GSPO
   stage_attr: ar
-  # Widened from the GSPO paper defaults (3e-4/4e-4): under vLLM-Omni rollout the
-  # rollout<->replay per-seq ratio sits ~0.86-0.98 (|1-ratio| ~2-14%), so the paper
-  # clip pins clip_fraction at 1.0 (fully clipped). 1e-3/2e-3 admits gradient.
+  # Freeze a train-side pre-update replay as pi_old. The vLLM rollout log-probs
+  # remain available separately for the k3 train/rollout consistency metric.
+  old_logp_source: replay
   clip_range: 1.0e-3
   clip_range_high: 1.33e-3
   clip_schedule: constant
   sampling_temperature: 1.0
-  # π_old anchor from a pre-update train-side replay (ratio starts ≈1 and the
-  # tiny GSPO clip only bites on optimizer drift). Under this mode the true
-  # training↔rollout KL is exposed via ``train_rollout_k3`` in the metrics,
-  # computed against the immutable ``segment.rollout_log_probs``.
-  old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions

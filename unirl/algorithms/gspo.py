@@ -67,6 +67,7 @@ class GSPOConfig(BaseAlgorithmConfig):
     # ratio, so the clip range is ~10-30x tighter (paper: ε≈3e-4).
     clip_range: float = 3e-4
     clip_schedule: str = "constant"
+    old_logp_source: str = "replay"
 
 
 class GSPO(StageAlgorithm):
@@ -98,12 +99,10 @@ class GSPO(StageAlgorithm):
             (``log_softmax(logits / T)``).
     """
 
-    # old_logp is the rollout (SGLang) log-prob, frozen on the segment and
-    # unchanged across mini-batch updates, so reusing it across
-    # num_updates_per_batch>1 is the deliberate rollout-anchored PPO ratio
-    # (verl bypass_mode=True parity), matching GRPO/DRPO; the ratio then absorbs
-    # the rollout-vs-train engine gap on later mini-batches (accepted for parity).
     supports_multi_update = True
+    # A replay anchor is frozen once before the update loop and then sliced with
+    # the same micro-batch geometry as the differentiable replay.
+    anchor_fields = ("log_probs",)
 
     # Upper bound on the per-sequence log-ratio before exp(), guarding against
     # overflow to inf when the sequence is far off-policy (early training).
@@ -122,6 +121,7 @@ class GSPO(StageAlgorithm):
         loss_agg_mode: str = "seq-mean",
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
+        old_logp_source: str = "replay",
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -139,6 +139,32 @@ class GSPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.old_logp_source = str(old_logp_source).strip().lower()
+        if self.old_logp_source not in ("rollout", "replay"):
+            raise ValueError(
+                "GSPO: old_logp_source must be 'rollout' or 'replay'; "
+                f"got {old_logp_source!r}"
+            )
+
+    def prepare_segment(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "TextSegment",
+    ) -> None:
+        """Freeze the pre-update policy used by the GSPO importance ratio."""
+        if self.old_logp_source != "replay":
+            return
+        if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:
+            return
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+        with torch.no_grad():
+            frozen = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                temperature=self.sampling_temperature,
+            )
+        segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(
         self,
@@ -158,10 +184,14 @@ class GSPO(StageAlgorithm):
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
         )  # [total_tokens]
-        # old_logp = the rollout log-prob, frozen on the segment — the deliberate
-        # rollout-anchored ratio across num_updates_per_batch steps (see the
-        # supports_multi_update class comment; verl bypass_mode=True parity).
+        # The ratio anchor is either the engine emission or the pre-update replay
+        # written by prepare_segment. Keep the engine emission separate for k3.
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
+        rollout_logp = (
+            segment.rollout_log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
+            if segment.rollout_log_probs is not None
+            else None
+        )
 
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
@@ -191,14 +221,10 @@ class GSPO(StageAlgorithm):
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
             **rollout_replay_logp_absdiff(new_logp, old_logp),
-            # Rollout↔replay drift on the raw PER-TOKEN log-probs (before the
-            # sequence reduction) — the direct autoregress-vs-replay correctness
-            # gauge. k3 is the calibrated KL surrogate (p=replay new, q=rollout
-            # old); on-policy it is ~0 and rises if any misaligns between rollout
-            # and replay.
-            **rollout_replay_k3(new_logp, old_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
+        # Report the real rollout↔training gap even when replay is the PPO anchor.
+        metrics.update(rollout_replay_k3(new_logp, rollout_logp if rollout_logp is not None else old_logp))
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,

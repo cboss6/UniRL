@@ -171,6 +171,7 @@ class Qwen3OmniChatTemplateStage:
                 "use_audio_in_video": True,
                 "fps": self.video_fps,
                 "do_sample_frames": False,
+                "truncation": True,
                 "return_tensors": "pt",
             }
             if size is not None:

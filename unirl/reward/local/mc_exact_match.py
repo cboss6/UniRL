@@ -14,7 +14,7 @@ from .base import LocalRewardBackend
 _ANSWER_TAG = re.compile(r"<answer>\s*([A-D])\s*</answer>", re.IGNORECASE)
 
 _ANSWER_PATTERN = re.compile(
-    r"(?:(?:answer|option)\s*(?:is|:)\s*)\(?([A-D])\)?",
+    r"(?:(?:answer|option)\s*(?:is|:)\s*)[\(\[]?\s*([A-D])\s*[\)\]]?",
     re.IGNORECASE,
 )
 
@@ -37,16 +37,21 @@ def _normalize_answer(answer: str) -> str:
     return a  # fallback
 
 
-def _extract_answer_letter(text: str) -> str:
+def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:
     text = text.strip()
+    tag_matches = _ANSWER_TAG.findall(text)
+    if tag_matches:
+        return tag_matches[-1].upper()
+    phrase = _ANSWER_PATTERN.search(text)
+    if require_phrase:
+        return phrase.group(1).upper() if phrase else ""
     # Handle numeric answers: "1"→"A", "2"→"B", "3"→"C", "4"→"D"
     if len(text) == 1 and text in "1234":
         return chr(ord("A") + ord(text) - ord("1"))
     if len(text) == 1 and text.upper() in "ABCD":
         return text.upper()
-    match = _ANSWER_PATTERN.search(text)
-    if match:
-        return match.group(1).upper()
+    if phrase:
+        return phrase.group(1).upper()
     matches = _STANDALONE_LETTER.findall(text)
     if matches:
         return matches[-1].upper()
@@ -88,6 +93,7 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
         del base_device
         super().__init__()
         self.graded_format_reward = bool(getattr(config, "graded_format_reward", False))
+        self.require_answer_phrase = bool(getattr(config, "require_answer_phrase", False))
 
     def _load_model(self) -> None:
         self.model = "mc_exact_match"
@@ -107,7 +113,7 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
                 predicted, fmt_weight = _extract_answer_letter_graded(text)
                 rewards.append(fmt_weight if predicted == gt else 0.0)
             else:
-                predicted = _extract_answer_letter(text)
+                predicted = _extract_answer_letter(text, require_phrase=self.require_answer_phrase)
                 rewards.append(1.0 if predicted == gt else 0.0)
 
         return rewards
@@ -118,3 +124,4 @@ class MCExactMatchSpec(BaseRewardComponentSpec):
     """Configure exact match and optional graded answer formatting."""
 
     graded_format_reward: bool = False
+    require_answer_phrase: bool = False

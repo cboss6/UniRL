@@ -253,6 +253,86 @@ def _patch_vllm_audio_truncation_lengths() -> None:
     Processor._unirl_audio_truncation_lengths_patched = True
 
 
+def _patch_vllm_audio_video_mrope_positions() -> None:
+    """Align vLLM audio-in-video delimiter positions with Transformers.
+
+    vLLM-Omni's interleaved branch inserts an extra ``audio_bos_pos`` after it
+    has already emitted the generic BOS position, then emits the same EOS
+    position twice. For
+
+    ``<vision_start><audio_start><video_pad>...<audio_end><vision_end>``
+
+    this shifts all interleaved positions by one and all following text
+    positions by two. Correct the returned positions using the actual expanded
+    token boundaries while retaining vLLM's interleaving calculation.
+    """
+    try:
+        import torch
+        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+            Qwen3OmniMoeThinkerForConditionalGeneration as Thinker,
+        )
+    except ImportError:
+        return
+    if getattr(Thinker, "_unirl_audio_video_mrope_patched", False):
+        return
+
+    original = Thinker.get_mrope_input_positions
+
+    def get_mrope_input_positions(
+        self: Any,
+        input_tokens: list[int],
+        mm_features: Any,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, int]:
+        positions, delta = original(self, input_tokens, mm_features, **kwargs)
+        config = self.config
+        audio_start = int(config.audio_start_token_id)
+        audio_end = int(config.audio_end_token_id)
+        audio_token = int(config.audio_token_id)
+        video_token = int(config.video_token_id)
+        tokens = torch.as_tensor(input_tokens, dtype=torch.long)
+
+        blocks: list[tuple[int, int]] = []
+        for start in (tokens == audio_start).nonzero().flatten().tolist():
+            video_start = int(start) + 1
+            if video_start >= tokens.numel() or int(tokens[video_start]) != video_token:
+                continue
+            audio_end_idx = video_start
+            while (
+                audio_end_idx < tokens.numel()
+                and int(tokens[audio_end_idx]) in (video_token, audio_token)
+            ):
+                audio_end_idx += 1
+            if audio_end_idx + 1 >= tokens.numel() or int(tokens[audio_end_idx]) != audio_end:
+                continue
+            blocks.append((video_start, audio_end_idx))
+        if not blocks:
+            return positions, delta
+
+        corrected = positions.clone()
+        cursor = 0
+        cumulative_shift = 0
+        for video_start, audio_end_idx in blocks:
+            corrected[:, cursor:video_start] = positions[:, cursor:video_start] + cumulative_shift
+            # Drop the duplicated audio-BOS slot: each video placeholder takes
+            # the next interleaved position, including the final one currently
+            # (incorrectly) assigned to <audio_end>.
+            corrected[:, video_start:audio_end_idx] = (
+                positions[:, video_start + 1 : audio_end_idx + 1] + cumulative_shift
+            )
+            eos_position = positions[:, audio_end_idx + 1] + cumulative_shift
+            corrected[:, audio_end_idx] = eos_position
+            corrected[:, audio_end_idx + 1] = eos_position + 1
+            cursor = audio_end_idx + 2
+            cumulative_shift += 2
+        corrected[:, cursor:] = positions[:, cursor:] + cumulative_shift
+        corrected_delta = int(corrected.max().item()) + 1 - len(input_tokens)
+        return corrected, corrected_delta
+
+    Thinker.get_mrope_input_positions = get_mrope_input_positions
+    Thinker._unirl_audio_video_mrope_patched = True
+
+
 def apply() -> None:
     """Apply all Qwen3-Omni patches once."""
     global _APPLIED
@@ -262,6 +342,7 @@ def apply() -> None:
     _patch_hf_processor_for_qwen3_omni()
     _patch_hf_tokenizer_for_qwen3_omni()
     _patch_vllm_audio_truncation_lengths()
+    _patch_vllm_audio_video_mrope_positions()
     _APPLIED = True
 
 

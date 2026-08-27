@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Type
 
@@ -16,6 +17,7 @@ from .base import (
     StageAlgorithm,
     _grpo_clip_loss,
     _resolve_clip_range_from_schedule,
+    rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -27,6 +29,8 @@ class GRPOConfig(BaseAlgorithmConfig):
     conditions_cls: str = ""
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
+    alignment_probe: bool = False
+    alignment_gate_only: bool = False
 
 
 class GRPO(StageAlgorithm):
@@ -47,6 +51,8 @@ class GRPO(StageAlgorithm):
         horizon: int = 8192,
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
+        alignment_probe: bool = False,
+        alignment_gate_only: bool = False,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -65,6 +71,67 @@ class GRPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.alignment_probe = bool(alignment_probe)
+        self.alignment_gate_only = bool(alignment_gate_only)
+
+    def prepare_segment(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "TextSegment",
+    ) -> None:
+        """Capture a no-grad actor replay separately from the rollout anchor."""
+        if (
+            not self.alignment_probe
+            or segment.tokens is None
+            or segment.log_probs is None
+            or int(segment.tokens.shape[0]) == 0
+        ):
+            return
+        if segment.rollout_log_probs is None:
+            segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+        previous_record = os.environ.get("UNIMATCH_STAGE_DUMP_RECORD")
+        if os.environ.get("UNIMATCH_STAGE_DUMP_DIR"):
+            os.environ["UNIMATCH_STAGE_DUMP_RECORD"] = "batch"
+        try:
+            with torch.no_grad():
+                actor_logp = self.stage.replay(
+                    typed_conds,
+                    segment=segment,
+                    temperature=self.sampling_temperature,
+                )
+        finally:
+            if previous_record is None:
+                os.environ.pop("UNIMATCH_STAGE_DUMP_RECORD", None)
+            else:
+                os.environ["UNIMATCH_STAGE_DUMP_RECORD"] = previous_record
+        segment.actor_log_probs = actor_logp.detach().cpu()
+        if os.environ.get("UNIRL_K3_DEBUG", "0") == "1":
+            rollout = segment.rollout_log_probs
+            count = min(32, int(actor_logp.numel()))
+            rollout_device = rollout.to(
+                dtype=actor_logp.dtype,
+                device=actor_logp.device,
+            )
+            mismatch = torch.nonzero(
+                actor_logp != rollout_device,
+                as_tuple=False,
+            ).reshape(-1)
+            prompt = getattr(typed_conds, "prompt", None)
+            prompt_ids = getattr(prompt, "input_ids", None)
+            print(
+                "[unirl.k3.debug] "
+                f"prompt_shape={tuple(prompt_ids.shape) if prompt_ids is not None else None} "
+                f"prompt_tail={prompt_ids.reshape(-1)[-8:].detach().cpu().tolist() if prompt_ids is not None else None} "
+                f"mismatch_count={int(mismatch.numel())} "
+                f"first_mismatch={int(mismatch[0]) if mismatch.numel() else None} "
+                f"last_mismatch={int(mismatch[-1]) if mismatch.numel() else None} "
+                f"tokens={segment.tokens[:count].detach().cpu().tolist()} "
+                f"rollout={rollout[:count].detach().cpu().tolist()} "
+                f"actor={actor_logp[:count].detach().cpu().tolist()}",
+                flush=True,
+            )
 
     def compute_loss_and_backward(
         self,
@@ -79,6 +146,43 @@ class GRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
         if int(segment.tokens.shape[0]) == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+
+        if self.alignment_gate_only:
+            if segment.actor_log_probs is None:
+                raise RuntimeError(
+                    "GRPO alignment_gate_only requires alignment_probe actor logprobs"
+                )
+            rollout_logp = (
+                segment.rollout_log_probs
+                if segment.rollout_log_probs is not None
+                else segment.log_probs
+            )
+            actor_logp = segment.actor_log_probs.to(
+                dtype=rollout_logp.dtype,
+                device=rollout_logp.device,
+            )
+            actor_absdiff = rollout_replay_logp_absdiff(actor_logp, rollout_logp)
+            actor_k3 = rollout_replay_k3(actor_logp, rollout_logp)
+            metrics = {
+                "actor_rollout_logp_absdiff_mean": actor_absdiff[
+                    "rollout_replay_logp_absdiff_mean"
+                ],
+                "actor_rollout_logp_absdiff_max": actor_absdiff[
+                    "rollout_replay_logp_absdiff_max"
+                ],
+                "k3_mean": actor_k3["k3_mean"],
+                "k3_max": actor_k3["k3_max"],
+                **{
+                    f"actor_rollout_{key}": value
+                    for key, value in actor_k3.items()
+                },
+            }
+            return AlgorithmStepResult(
+                loss=0.0,
+                metrics=metrics,
+                num_steps_or_tokens=int(actor_logp.shape[0]),
+                has_backward=False,
+            )
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
@@ -117,6 +221,33 @@ class GRPO(StageAlgorithm):
             **rollout_replay_logp_absdiff(new_logp, old_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
+        if segment.actor_log_probs is not None:
+            rollout_logp = (
+                segment.rollout_log_probs
+                if segment.rollout_log_probs is not None
+                else segment.log_probs
+            ).to(dtype=new_logp.dtype, device=new_logp.device)
+            actor_logp = segment.actor_log_probs.to(
+                dtype=new_logp.dtype, device=new_logp.device
+            )
+            actor_absdiff = rollout_replay_logp_absdiff(actor_logp, rollout_logp)
+            actor_k3 = rollout_replay_k3(actor_logp, rollout_logp)
+            metrics.update(
+                {
+                    "actor_rollout_logp_absdiff_mean": actor_absdiff[
+                        "rollout_replay_logp_absdiff_mean"
+                    ],
+                    "actor_rollout_logp_absdiff_max": actor_absdiff[
+                        "rollout_replay_logp_absdiff_max"
+                    ],
+                    "k3_mean": actor_k3["k3_mean"],
+                    "k3_max": actor_k3["k3_max"],
+                    **{
+                        f"actor_rollout_{key}": value
+                        for key, value in actor_k3.items()
+                    },
+                }
+            )
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,

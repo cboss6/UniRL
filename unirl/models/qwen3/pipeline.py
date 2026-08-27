@@ -27,6 +27,8 @@ class Qwen3Pipeline(Pipeline):
         ar: Optional[Qwen3ARStage] = None,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        exact_actor_logprobs: bool = False,
+        exact_actor_decode_replay: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -34,7 +36,13 @@ class Qwen3Pipeline(Pipeline):
         self.ar = (
             ar
             if ar is not None
-            else Qwen3ARStage(model=bundle, autocast_precision=autocast_precision, logprob_precision=logprob_precision)
+            else Qwen3ARStage(
+                model=bundle,
+                autocast_precision=autocast_precision,
+                logprob_precision=logprob_precision,
+                exact_actor_logprobs=exact_actor_logprobs,
+                exact_actor_decode_replay=exact_actor_decode_replay,
+            )
         )
 
     @classmethod
@@ -47,6 +55,8 @@ class Qwen3Pipeline(Pipeline):
         logprob_precision: str = "fp32",
         enable_thinking: bool = False,
         max_prompt_length: int = 4096,
+        exact_actor_logprobs: bool = False,
+        exact_actor_decode_replay: bool = False,
     ) -> "Qwen3Pipeline":
         """Wire chat-template + AR stages around an already-loaded bundle."""
         chat_template = Qwen3ChatTemplateStage(
@@ -59,6 +69,8 @@ class Qwen3Pipeline(Pipeline):
             model=bundle,
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
+            exact_actor_logprobs=exact_actor_logprobs,
+            exact_actor_decode_replay=exact_actor_decode_replay,
         )
         return cls(
             bundle=bundle,
@@ -66,6 +78,8 @@ class Qwen3Pipeline(Pipeline):
             ar=ar,
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
+            exact_actor_logprobs=exact_actor_logprobs,
+            exact_actor_decode_replay=exact_actor_decode_replay,
         )
 
     @classmethod
@@ -82,6 +96,8 @@ class Qwen3Pipeline(Pipeline):
             model=bundle,
             autocast_precision=config.autocast_precision,
             logprob_precision=config.logprob_precision,
+            exact_actor_logprobs=config.exact_actor_logprobs,
+            exact_actor_decode_replay=config.exact_actor_decode_replay,
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 

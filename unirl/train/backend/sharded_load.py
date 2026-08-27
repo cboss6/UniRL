@@ -54,6 +54,24 @@ def load_trainable_weights(
             n_recovered,
             retied,
         )
+        if os.environ.get("UNIRL_WEIGHT_DEBUG", "0") == "1":
+            for name, parameter in model.named_parameters():
+                canonical = canonical_param_name(name)
+                if canonical.endswith(
+                    ("embed_tokens.weight", "lm_head.weight")
+                ):
+                    local = (
+                        parameter.to_local()
+                        if hasattr(parameter, "to_local")
+                        else parameter
+                    )
+                    print(
+                        "[unirl.weight.debug] "
+                        f"rank={rank} name={canonical} "
+                        f"shape={tuple(local.shape)} "
+                        f"values={local.reshape(-1)[:8].float().cpu().tolist()}",
+                        flush=True,
+                    )
         return
 
     materialize = getattr(bundle, "materialize", None)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -24,6 +25,7 @@ from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
 logger = logging.getLogger(__name__)
+_LM_DEBUGGED = False
 
 _SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
 
@@ -50,6 +52,57 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     except Exception:
         return False
     return True
+
+
+def _exact_actor_enabled(model: Any) -> bool:
+    return bool(
+        getattr(model, "_unirl_exact_actor_logprobs", False)
+        and ((not model.training) or (not torch.is_grad_enabled()))
+    )
+
+
+def _exact_actor_context(model: Any):
+    if not _exact_actor_enabled(model):
+        return nullcontext()
+    from unimatch.adaptor.fsdp.hf_aten import exact_mode, register_aten
+
+    register_aten()
+    return exact_mode(True)
+
+
+def _selected_token_log_probs(
+    model: Any,
+    hidden: torch.Tensor,
+    tokens: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    global _LM_DEBUGGED
+    with _exact_actor_context(model):
+        logits = model.lm_head(hidden).float() / temperature
+        if (
+            not _LM_DEBUGGED
+            and __import__("os").environ.get("UNIMATCH_LM_DEBUG", "0") == "1"
+        ):
+            token_id = int(tokens.reshape(-1)[0])
+            print(
+                "[unimatch.fsdp.lm.debug] "
+                f"hidden={hidden.reshape(-1, hidden.shape[-1])[0, :8].float().detach().cpu().tolist()} "
+                f"token={token_id} "
+                f"selected={float(logits.reshape(-1, logits.shape[-1])[0, token_id])} "
+                f"top={torch.topk(logits.reshape(-1, logits.shape[-1])[0], 4).values.detach().cpu().tolist()}",
+                flush=True,
+            )
+            _LM_DEBUGGED = True
+        if _exact_actor_enabled(model):
+            from unimatch.adaptor.vllm.patches.batch_invariant_reductions.reductions_triton import (
+                log_softmax,
+            )
+
+            return log_softmax(logits, dim=-1).gather(
+                -1, tokens.unsqueeze(-1)
+            ).squeeze(-1)
+        chosen = logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        return chosen - torch.logsumexp(logits, dim=-1)
 
 
 def _replay_aware_forward(
@@ -80,8 +133,9 @@ def _replay_aware_forward(
     autocast_ctx = (
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
     )
-    with autocast_ctx:
-        hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
+    with _exact_actor_context(self):
+        with autocast_ctx:
+            hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
 
     T = float(temperature) if float(temperature) > 0.0 else 1.0
     value_head = getattr(self, "value_head", None) if return_values else None
@@ -91,8 +145,7 @@ def _replay_aware_forward(
         targets = response_tokens
 
         def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-            lf = self.lm_head(h).float() / T
-            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+            return _selected_token_log_probs(self, h, tok, T)
 
         flat_parts: List[torch.Tensor] = []
         flat_chunk = 2048
@@ -118,9 +171,7 @@ def _replay_aware_forward(
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
     def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-        lf = self.lm_head(h).float() / T
-        chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
-        return chosen - torch.logsumexp(lf, dim=-1)
+        return _selected_token_log_probs(self, h, tok, T)
 
     bsz = resp_hidden.size(0)
     chunk = max(64, 2048 // max(1, bsz))
@@ -248,13 +299,21 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         model: Qwen3Bundle,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        exact_actor_logprobs: bool = False,
+        exact_actor_decode_replay: bool = False,
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
         transformer = model.transformer
+        transformer._unirl_exact_actor_logprobs = bool(exact_actor_logprobs)
+        self.exact_actor_decode_replay = bool(exact_actor_decode_replay)
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
+        if os.environ.get("UNIMATCH_STAGE_DUMP_DIR"):
+            from .stage_dump import install_qwen3_stage_dump_hooks
+
+            install_qwen3_stage_dump_hooks(transformer)
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the HF causal LM module — the FSDP/LoRA wrap target."""
@@ -357,6 +416,16 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
     ) -> Union[torch.Tensor, ReplayResult]:
         """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
         _require_value_head_for_replay(self.model.transformer, return_values)
+        if (
+            self.exact_actor_decode_replay
+            and not torch.is_grad_enabled()
+            and not return_values
+        ):
+            return self.decode_topology_replay(
+                conditions,
+                segment=segment,
+                temperature=temperature,
+            )
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(
@@ -373,6 +442,86 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             temperature=temperature,
             return_values=return_values,
         )
+
+    def decode_topology_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Replay prompt prefill followed by one-token cache decode steps."""
+        if conditions.prompt is None or conditions.prompt.input_ids is None:
+            raise ValueError("decode_topology_replay requires prompt input_ids")
+        if conditions.prompt.attention_mask is None:
+            raise ValueError("decode_topology_replay requires prompt attention_mask")
+        if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
+            raise ValueError("decode_topology_replay requires packed response tokens")
+
+        transformer = self.model.transformer
+        device = next(transformer.parameters()).device
+        prompt_ids = conditions.prompt.input_ids.to(device)
+        prompt_mask = conditions.prompt.attention_mask.to(device)
+        response = segment.tokens.to(device=device, dtype=torch.long)
+        cu = [int(value) for value in segment.cu_seqlens.tolist()]
+        lengths = [int(value) for value in segment.lengths.tolist()]
+        scale = float(temperature) if float(temperature) > 0.0 else 1.0
+        pieces: List[torch.Tensor] = []
+
+        from unimatch.adaptor.vllm.patches.batch_invariant_reductions.reductions_triton import (
+            log_softmax,
+        )
+
+        for batch_index, response_length in enumerate(lengths):
+            if response_length <= 0:
+                continue
+            prompt_length = int(prompt_mask[batch_index].long().sum().item())
+            ids = prompt_ids[batch_index : batch_index + 1, :prompt_length]
+            attention_mask = torch.ones_like(ids)
+            with _exact_actor_context(transformer):
+                output = transformer(
+                    input_ids=ids,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    return_dict=True,
+                )
+            past = output.past_key_values
+            row_tokens = response[cu[batch_index] : cu[batch_index] + response_length]
+            row_logprobs: List[torch.Tensor] = []
+            logits = output.logits[:, -1, :].float() / scale
+            row_logprobs.append(
+                log_softmax(logits, dim=-1).gather(
+                    -1, row_tokens[0].view(1, 1)
+                ).reshape(())
+            )
+            for token_offset in range(1, response_length):
+                input_token = row_tokens[token_offset - 1].view(1, 1)
+                attention_mask = torch.ones(
+                    1,
+                    prompt_length + token_offset,
+                    dtype=torch.long,
+                    device=device,
+                )
+                with _exact_actor_context(transformer):
+                    output = transformer(
+                        input_ids=input_token,
+                        attention_mask=attention_mask,
+                        past_key_values=past,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                past = output.past_key_values
+                logits = output.logits[:, -1, :].float() / scale
+                row_logprobs.append(
+                    log_softmax(logits, dim=-1).gather(
+                        -1, row_tokens[token_offset].view(1, 1)
+                    ).reshape(())
+                )
+            pieces.append(torch.stack(row_logprobs))
+
+        if not pieces:
+            return torch.zeros(0, dtype=self.logprob_dtype, device=device)
+        return torch.cat(pieces).to(dtype=self.logprob_dtype)
 
     def packed_replay(
         self,

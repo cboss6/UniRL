@@ -94,9 +94,7 @@ def _selected_token_log_probs(
             )
             _LM_DEBUGGED = True
         if _exact_actor_enabled(model):
-            from unimatch.adaptor.vllm.patches.batch_invariant_reductions.reductions_triton import (
-                log_softmax,
-            )
+            from unimatch.functional.reductions import log_softmax
 
             return log_softmax(logits, dim=-1).gather(
                 -1, tokens.unsqueeze(-1)
@@ -491,9 +489,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         scale = float(temperature) if float(temperature) > 0.0 else 1.0
         pieces: List[torch.Tensor] = []
 
-        from unimatch.adaptor.vllm.patches.batch_invariant_reductions.reductions_triton import (
-            log_softmax,
-        )
+        from unimatch.functional.reductions import log_softmax
 
         for batch_index, response_length in enumerate(lengths):
             if response_length <= 0:

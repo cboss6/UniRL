@@ -36,6 +36,7 @@ export UNIRL_VEOMNI_STREAMING_GRAD_NORM=${UNIRL_VEOMNI_STREAMING_GRAD_NORM:-1}
 export UNIMATCH_VEOMNI_EP4_EXACT=1
 export UNIMATCH_STRICT_PATCH=1
 export UNIMATCH_PATCHES=${UNIMATCH_PATCHES:-qwen3_moe,batch_invariant_reductions,batch_invariant_norm,batch_invariant_precision,batch_invariant_attention}
+export UNIMATCH_REDUCTION_PROVIDER=${UNIMATCH_REDUCTION_PROVIDER:-vllm_bi}
 export UNIMATCH_FSDP_PATCHES=qwen3_moe
 export UNIMATCH_HF_ATEN_PATCHES=linear,softmax
 export UNIMATCH_QWEN3_MOE_COMPONENTS=${UNIMATCH_QWEN3_MOE_COMPONENTS:-experts_grouped,qkv_local,oproj_col,lm_head_col,gate_fp32,router_hf}

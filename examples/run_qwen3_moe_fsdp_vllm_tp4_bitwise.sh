@@ -25,6 +25,7 @@ export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:16:8}
 
 export UNIMATCH_STRICT_PATCH=1
 export UNIMATCH_PATCHES=${UNIMATCH_PATCHES:-qwen3_moe,batch_invariant_reductions,batch_invariant_norm,batch_invariant_precision,batch_invariant_attention}
+export UNIMATCH_REDUCTION_PROVIDER=${UNIMATCH_REDUCTION_PROVIDER:-vllm_bi}
 if [[ "${UNIMATCH_DISABLE_VLLM_PATCH:-0}" == "1" ]]; then
     export UNIMATCH_PATCHES=
 fi

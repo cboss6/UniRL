@@ -8,6 +8,54 @@ from typing import List, Optional
 class UniRLWeightSyncExtension:
     """Deserialize a UniRL tensor bucket inside each TP worker."""
 
+    def unirl_before_sleep(self) -> None:
+        """Drop cached UniMatch buffers whose CuMem mappings will be released."""
+        import torch
+
+        torch.cuda.synchronize()
+        from unimatch.adaptor.vllm.patches.qwen3_dualcol import qwen3_modules
+        from unimatch.adaptor.vllm.patches.qwen3_moe_dualcol import (
+            gate_fp32,
+            grouped_runner,
+        )
+
+        qwen3_modules.close_all()
+        grouped_runner.close_all()
+        gate_fp32.close_all()
+        torch.cuda.synchronize()
+
+    def unirl_weight_digest(self) -> dict:
+        """Return a deterministic sampled digest for cross-replica checks."""
+        import hashlib
+
+        import torch
+
+        model = self.model_runner.get_model()
+        digest = hashlib.sha256()
+        count = 0
+        for name, parameter in sorted(model.named_parameters()):
+            flat = parameter.detach().reshape(-1)
+            if not flat.numel():
+                continue
+            indices = torch.tensor(
+                sorted({0, int(flat.numel()) // 2, int(flat.numel()) - 1}),
+                dtype=torch.int64,
+                device=flat.device,
+            )
+            sample = flat.index_select(0, indices).contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tuple(parameter.shape)).encode("ascii"))
+            digest.update(str(parameter.dtype).encode("ascii"))
+            digest.update(
+                sample.view(torch.uint8).cpu().numpy().tobytes()
+            )
+            count += 1
+        return {
+            "rank": int(getattr(self, "rank", 0)),
+            "parameters": count,
+            "sha256": digest.hexdigest(),
+        }
+
     def unirl_weight_debug(self) -> dict:
         model = self.model_runner.get_model()
         selected = {}

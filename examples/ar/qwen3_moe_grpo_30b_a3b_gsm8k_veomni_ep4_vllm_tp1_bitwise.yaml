@@ -1,5 +1,5 @@
 # @package _global_
-# Qwen3-30B-A3B: direct vLLM TP4 rollout + HF FSDP2 actor, strict UniMatch K3 gate.
+# Qwen3-30B-A3B: VeOmni DP4/EP4 actor + four colocated vLLM TP1/EP1 rollouts.
 
 num_devices: 4
 devices_per_node: 4
@@ -15,23 +15,23 @@ normalize_adv_by_std: true
 logging:
   report_to_wandb: false
   project_name: unirl-qwen3-bitwise
-  run_name: qwen3-30b-a3b-fsdp-vllm-tp4
+  run_name: qwen3-30b-a3b-veomni-ep4-vllm-tp1
   entity: null
-  tags: [qwen3-moe, fsdp, vllm, tp4, bitwise]
+  tags: [qwen3-moe, veomni, ep4, vllm, tp1, bitwise]
 
 bundle:
-  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  _target_: unirl.models.qwen3_moe.bundle.Qwen3MoeBundle.from_config
   config:
     _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
     meta_init_transformer: true
     model_precision: bf16
     attn_implementation: flash_attention_3
+    ep_comm_backend: ${oc.env:UNIRL_EP_COMM_BACKEND,unimatch}
     autocast_precision: bf16
     logprob_precision: fp32
     exact_actor_logprobs: true
     exact_actor_decode_replay: false
-    external_libs: [unimatch.adaptor.fsdp.bootstrap]
     use_gradient_checkpointing: true
     max_prompt_length: 256
 
@@ -45,7 +45,7 @@ pipeline:
   exact_actor_decode_replay: false
 
 backend:
-  _target_: unirl.train.backend.fsdp.FSDPBackend
+  _target_: unirl.train.backend.veomni.backend.VeOmniBackend
   block_class_names: ["Qwen3MoeDecoderLayer"]
   trainable_attr: transformer
   fsdp_cfg:
@@ -57,7 +57,8 @@ backend:
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
-    forward_prefetch: false
+    sp_size: 1
+    ep_size: 4
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-6
@@ -73,23 +74,37 @@ backend:
 
 rollout:
   _target_: unirl.rollout.engine.vllm.engine.VLLMRolloutEngine
+  ep_size: 1
   config:
     _target_: unirl.rollout.engine.vllm.config.VLLMEngineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
-    tp_size: 4
-    max_new_tokens: 32
+    tp_size: 1
+    max_new_tokens: 1024
     temperature: 1.0
     top_p: 1.0
     top_k: 0
-    ignore_eos: false
+    ignore_eos: true
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
       max_model_len: 1280
       max_num_batched_tokens: 1280
-      max_num_seqs: 16
-      gpu_memory_utilization: 0.6
+      max_num_seqs: 1
+      # TP1 holds the complete 30B checkpoint. A 0.65 budget leaves roughly
+      # 4–5 GiB for this 1280-token/one-sequence KV cache and preserves enough
+      # HBM for post-update VeOmni optimizer state on every EP rank.
+      gpu_memory_utilization: 0.65
+      # One 1280-token TP1 request needs far less than 1 GiB of KV. Pinning the
+      # cache avoids vLLM consuming every byte allowed by the utilization budget
+      # and makes post-optimizer wake deterministic across EP ranks.
+      kv_cache_memory_bytes: 1073741824
       disable_log_stats: true
+      enable_sleep_mode: true
+      enforce_eager: true
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+      moe_backend: triton
+      logprobs_mode: processed_logprobs
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -107,7 +122,7 @@ algorithm:
   clip_range_high: 0.28
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-sum-norm
-  horizon: 32
+  horizon: 1024
   sampling_temperature: 1.0
   alignment_probe: true
   alignment_gate_only: false
@@ -141,8 +156,8 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
-  samples_per_prompt: 4
+  samples_per_prompt: 1
   temperature: 1.0
   top_p: 1.0
   top_k: 0
-  max_new_tokens: 32
+  max_new_tokens: 1024

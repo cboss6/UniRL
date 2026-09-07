@@ -32,7 +32,16 @@ _STAGE_ORDER = {
             "oproj_output",
             "attention_output",
             "router_logits",
+            "router_topk_weights",
+            "topk",
+            "routing_weights",
             "moe_input",
+            "canonical_dispatch",
+            "fc1",
+            "activation",
+            "fc2",
+            "rank_partial",
+            "final",
             "moe_output",
             "layer_output",
         )
@@ -60,7 +69,7 @@ def canonicalize(value: torch.Tensor) -> torch.Tensor:
     return value.contiguous()
 
 
-def align(vllm: torch.Tensor, fsdp: torch.Tensor, stage: str):
+def align(vllm: torch.Tensor, actor: torch.Tensor, stage: str):
     if stage in {
         "q_norm",
         "k_norm",
@@ -69,37 +78,37 @@ def align(vllm: torch.Tensor, fsdp: torch.Tensor, stage: str):
         "v_attn",
         "attn_core_output",
     }:
-        if fsdp.ndim == 4 and fsdp.shape[0] == 1:
-            fsdp = fsdp.squeeze(0)
-            if fsdp.shape[1:] != vllm.shape[1:]:
-                fsdp = fsdp.permute(1, 0, 2)
+        if actor.ndim == 4 and actor.shape[0] == 1:
+            actor = actor.squeeze(0)
+            if actor.shape[1:] != vllm.shape[1:]:
+                actor = actor.permute(1, 0, 2)
         elif (
-            fsdp.ndim == 3
+            actor.ndim == 3
             and vllm.ndim == 3
-            and fsdp.shape[0] == vllm.shape[1]
-            and fsdp.shape[2] == vllm.shape[2]
+            and actor.shape[0] == vllm.shape[1]
+            and actor.shape[2] == vllm.shape[2]
         ):
-            fsdp = fsdp.permute(1, 0, 2)
+            actor = actor.permute(1, 0, 2)
         if (
             stage in {"k_rope", "v_attn"}
-            and fsdp.ndim == 3
+            and actor.ndim == 3
             and vllm.ndim == 3
-            and fsdp.shape[0] > vllm.shape[0]
+            and actor.shape[0] > vllm.shape[0]
         ):
-            fsdp = fsdp[-1:]
+            actor = actor[-1:]
         if (
             vllm.ndim == 3
-            and fsdp.ndim == 3
-            and vllm.shape[1:] == fsdp.shape[1:]
+            and actor.ndim == 3
+            and vllm.shape[1:] == actor.shape[1:]
         ):
-            vllm = vllm[: fsdp.shape[0]]
-        return vllm.contiguous(), fsdp.contiguous()
+            vllm = vllm[: actor.shape[0]]
+        return vllm.contiguous(), actor.contiguous()
     vllm = canonicalize(vllm)
-    fsdp = canonicalize(fsdp)
-    if vllm.ndim == fsdp.ndim and vllm.shape[1:] == fsdp.shape[1:]:
-        if vllm.shape[0] >= fsdp.shape[0]:
-            vllm = vllm[: fsdp.shape[0]]
-    return vllm, fsdp
+    actor = canonicalize(actor)
+    if vllm.ndim == actor.ndim and vllm.shape[1:] == actor.shape[1:]:
+        if vllm.shape[0] >= actor.shape[0]:
+            vllm = vllm[: actor.shape[0]]
+    return vllm, actor
 
 
 def main() -> None:
@@ -107,7 +116,15 @@ def main() -> None:
     parser.add_argument("--root", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--vllm-rank", type=int, default=0)
-    parser.add_argument("--fsdp-rank", type=int, default=0)
+    parser.add_argument(
+        "--vllm-tp-size",
+        type=int,
+        default=None,
+        help="Number of rank directories that are TP shards; use 1 for TP1 DP replicas.",
+    )
+    parser.add_argument("--actor-side", choices=("fsdp", "veomni"), default="fsdp")
+    parser.add_argument("--actor-rank", type=int, default=0)
+    parser.add_argument("--fsdp-rank", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--skip-stages", default="")
     parser.add_argument("--output")
     args = parser.parse_args()
@@ -120,7 +137,12 @@ def main() -> None:
         if path.is_dir()
     }
     vllm_files = vllm_files_by_rank.get(args.vllm_rank, {})
-    fsdp_files = collect(run / "fsdp" / f"rank{args.fsdp_rank:02d}")
+    actor_rank = (
+        args.fsdp_rank
+        if args.fsdp_rank is not None and args.actor_side == "fsdp"
+        else args.actor_rank
+    )
+    actor_files = collect(run / args.actor_side / f"rank{actor_rank:02d}")
     skipped_stages = {
         stage.strip()
         for stage in args.skip_stages.split(",")
@@ -128,7 +150,7 @@ def main() -> None:
     }
     shared = {
         key
-        for key in set(vllm_files) & set(fsdp_files)
+        for key in set(vllm_files) & set(actor_files)
         if key[2] not in skipped_stages
     }
     ordered = sorted(
@@ -146,6 +168,11 @@ def main() -> None:
         "first_divergence": None,
     }
     for layer, call, stage in ordered:
+        reconstruct_tp = (
+            args.vllm_tp_size
+            if args.vllm_tp_size is not None
+            else len(vllm_files_by_rank)
+        )
         if stage in {
             "q_proj",
             "k_proj",
@@ -157,10 +184,11 @@ def main() -> None:
             "v_attn",
             "attn_core_output",
             "oproj_input",
-        } and len(vllm_files_by_rank) > 1:
+        } and reconstruct_tp > 1:
             shards = [
                 torch.load(files[(layer, call, stage)], map_location="cpu")
-                for _, files in sorted(vllm_files_by_rank.items())
+                for rank, files in sorted(vllm_files_by_rank.items())
+                if rank < reconstruct_tp
                 if (layer, call, stage) in files
             ]
             dim = (
@@ -182,26 +210,26 @@ def main() -> None:
                 vllm_files[(layer, call, stage)],
                 map_location="cpu",
             )
-        vllm, fsdp = align(
+        vllm, actor = align(
             vllm_value,
-            torch.load(fsdp_files[(layer, call, stage)], map_location="cpu"),
+            torch.load(actor_files[(layer, call, stage)], map_location="cpu"),
             stage,
         )
-        if vllm.shape != fsdp.shape:
+        if vllm.shape != actor.shape:
             report["skipped_shape"].append(
                 {
                     "layer": layer,
                     "call": call,
                     "stage": stage,
                     "vllm": list(vllm.shape),
-                    "fsdp": list(fsdp.shape),
+                    "actor": list(actor.shape),
                 }
             )
             continue
         report["compared"] += 1
-        if torch.equal(vllm, fsdp):
+        if torch.equal(vllm, actor):
             continue
-        different = (vllm != fsdp).reshape(-1)
+        different = (vllm != actor).reshape(-1)
         first = int(torch.nonzero(different, as_tuple=False)[0])
         report["first_divergence"] = {
             "layer": layer,
@@ -212,10 +240,10 @@ def main() -> None:
             "elements": int(different.numel()),
             "first_flat_index": first,
             "vllm_value": float(vllm.reshape(-1)[first]),
-            "fsdp_value": float(fsdp.reshape(-1)[first]),
-            "max_abs": float((vllm.float() - fsdp.float()).abs().max()),
+            "actor_value": float(actor.reshape(-1)[first]),
+            "max_abs": float((vllm.float() - actor.float()).abs().max()),
             "vllm_file": str(vllm_files[(layer, call, stage)]),
-            "fsdp_file": str(fsdp_files[(layer, call, stage)]),
+            "actor_file": str(actor_files[(layer, call, stage)]),
         }
         break
 

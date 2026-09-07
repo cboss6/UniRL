@@ -55,6 +55,7 @@ class VeOmniBackend(BaseFSDP2Backend):
         with_aux: Tuple[str, ...] = (),
     ) -> None:
         super().__init__()
+        self._closed = False
         self._check_lora_exclusivity(lora_cfg, ema_lora_cfg)
         _validate_fsdp_cfg(fsdp_cfg)
 
@@ -192,6 +193,16 @@ class VeOmniBackend(BaseFSDP2Backend):
 
     def _offload_model(self) -> None:
         veomni_offload(self.model)
+
+    def close(self) -> None:
+        """Release EP communication resources during ``Worker.teardown``."""
+
+        if self._closed:
+            return
+        self._closed = True
+        close_expert_parallel = getattr(self._bundle, "close_expert_parallel", None)
+        if callable(close_expert_parallel):
+            close_expert_parallel()
 
     def _reject_meta(self, *, operation, checkpoint_format, mode) -> None:
         super()._reject_meta(

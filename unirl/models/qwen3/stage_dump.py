@@ -13,6 +13,8 @@ def install_qwen3_stage_dump_hooks(transformer) -> None:
 
     from unimatch.diagnostics.stage_dump import emit_stage, stage_dump_enabled
 
+    side = "veomni" if type(transformer).__module__.startswith("veomni.") else "fsdp"
+
     def tensor(value):
         return value[0] if isinstance(value, tuple) else value
 
@@ -26,7 +28,7 @@ def install_qwen3_stage_dump_hooks(transformer) -> None:
         call = int(counters.get(stage, 0))
         counters[stage] = call + 1
         emit_stage(
-            "fsdp",
+            side,
             stage,
             tensor(value),
             layer=layer,

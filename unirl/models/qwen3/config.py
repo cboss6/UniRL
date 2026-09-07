@@ -41,8 +41,23 @@ class Qwen3PipelineConfig:
     enable_thinking: bool = False
     max_prompt_length: int = 4096
 
+    moe_implementation: Optional[str] = None
+    ep_comm_backend: str = "torch"
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3PipelineConfig.model_precision")
+        backend = str(self.ep_comm_backend).strip().lower()
+        if backend not in {"torch", "deepep_ht", "unimatch"}:
+            raise ValueError(
+                "Qwen3PipelineConfig.ep_comm_backend must be one of "
+                f"'torch', 'deepep_ht', 'unimatch'; got {self.ep_comm_backend!r}"
+            )
+        self.ep_comm_backend = backend
+        if self.moe_implementation is not None:
+            implementation = str(self.moe_implementation).strip()
+            if not implementation:
+                raise ValueError("Qwen3PipelineConfig.moe_implementation cannot be empty")
+            self.moe_implementation = implementation
 
 
 __all__ = ["Qwen3PipelineConfig"]

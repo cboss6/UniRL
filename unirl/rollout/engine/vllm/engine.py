@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,39 @@ from unirl.rollout.engine.vllm.runtime import engine_process_main
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_visible_devices(
+    tp_size: int,
+    tp_visible_devices: Optional[List[str]],
+) -> List[str]:
+    if tp_visible_devices is not None:
+        return list(tp_visible_devices)
+    inherited = [
+        token.strip()
+        for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if token.strip()
+    ]
+    if inherited:
+        return inherited[:tp_size]
+    return [str(index) for index in range(tp_size)]
+
+
+def _resolve_rollout_rank(
+    rank: Optional[int],
+    tp_size: int,
+    visible_devices: List[str],
+) -> int:
+    if rank is not None:
+        return int(rank)
+    if tp_size == 1 and visible_devices:
+        try:
+            physical = int(visible_devices[0])
+            base = int(os.environ.get("UNIRL_PHYSICAL_GPU_BASE", "0"))
+            return physical - base
+        except ValueError:
+            pass
+    return 0
 
 
 class VLLMRolloutEngine(BaseRolloutEngine):
@@ -59,6 +93,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         self._tp_size = int(tp_size)
         self._is_tp_zero = self._tp_rank == 0
         self._is_offloaded = False
+        self._partially_awake = False
         self._version = 0
         self._lock = threading.Lock()
         self._process = None
@@ -68,11 +103,14 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero:
             return
 
-        visible = list(tp_visible_devices or [str(index) for index in range(self._tp_size)])
+        # Preserve Ray's physical CUDA token for each TP1 worker. Resetting a
+        # spawned child to literal "0" would bypass an outer 4,5,6,7 pin.
+        visible = _resolve_visible_devices(self._tp_size, tp_visible_devices)
         require(
             len(visible) == self._tp_size,
             f"direct vLLM expected {self._tp_size} visible devices, got {visible}",
         )
+        rollout_rank = _resolve_rollout_rank(rank, self._tp_size, visible)
 
         from transformers import AutoTokenizer
 
@@ -92,6 +130,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                 "config": {
                     "pretrained_model_ckpt_path": config.pretrained_model_ckpt_path,
                     "tp_size": self._tp_size,
+                    "rollout_rank": rollout_rank,
                     "engine_kwargs": dict(config.engine_kwargs or {}),
                 },
                 "visible_devices": visible,
@@ -141,17 +180,33 @@ class VLLMRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self, tags: Optional[List[str]] = None) -> None:
         del tags
-        if not self._is_tp_zero or self._is_offloaded:
+        if (
+            not self._is_tp_zero
+            or (self._is_offloaded and not self._partially_awake)
+        ):
             return
         self._request("sleep", level=1)
         self._is_offloaded = True
+        self._partially_awake = False
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
-        if not self._is_tp_zero or not self._is_offloaded:
+        if not self._is_tp_zero:
             return
-        self._request("wake_up", tags=tags)
-        self._is_offloaded = False
+        partial = bool(tags)
+        if partial:
+            if not self._is_offloaded or self._partially_awake:
+                return
+        elif not self._is_offloaded and not self._partially_awake:
+            return
+        request_tags = (
+            ["kv_cache"]
+            if not partial and self._partially_awake
+            else tags
+        )
+        self._request("wake_up", tags=request_tags)
+        self._partially_awake = partial
+        self._is_offloaded = partial
 
     def onload_weights(self, *, track_prefix: str = "") -> None:
         del track_prefix
@@ -165,6 +220,11 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero:
             return True
         return bool(self._request("health"))
+
+    def weight_digest(self) -> Optional[List[dict]]:
+        if not self._is_tp_zero:
+            return None
+        return list(self._request("weight_digest"))
 
     def update_weights_from_tensor(
         self,

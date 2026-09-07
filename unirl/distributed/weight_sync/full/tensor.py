@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
@@ -35,6 +36,68 @@ class TensorWeightSync(FullWeightSync):
             wire_dtype=wire_dtype,
         )
         self._rollout = rollout
+        self._extracted_buckets = None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def extract(self) -> None:
+        """Gather EP/FSDP weights to CPU before the actor is offloaded."""
+        import torch
+
+        if self._extracted_buckets is not None:
+            raise RuntimeError(
+                "TensorWeightSync.extract called with an unconsumed cache"
+            )
+        extracted = []
+        for bucket, is_last in self._iter_buckets():
+            cpu_bucket = [
+                (
+                    name,
+                    tensor.detach().to(
+                        device="cpu",
+                        dtype=self._wire_dtype or tensor.dtype,
+                        copy=True,
+                    ),
+                )
+                for name, tensor in bucket
+            ]
+            extracted.append((cpu_bucket, is_last))
+            del bucket
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        self._extracted_buckets = extracted
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def push(self) -> None:
+        """Push a CPU extraction after actor offload and staged weight wake."""
+        import torch
+
+        cached = self._extracted_buckets
+        if cached is None:
+            raise RuntimeError("TensorWeightSync.push requires extract() first")
+        original_iter = self._iter_buckets
+
+        def cached_cuda_buckets():
+            device = torch.device("cuda", torch.cuda.current_device())
+            for cpu_bucket, is_last in cached:
+                gpu_bucket = [
+                    (
+                        name,
+                        tensor.to(device=device, non_blocking=False).contiguous(),
+                    )
+                    for name, tensor in cpu_bucket
+                ]
+                yield gpu_bucket, is_last
+
+        self._iter_buckets = cached_cuda_buckets
+        try:
+            self.sync()
+        finally:
+            self._iter_buckets = original_iter
+            self._extracted_buckets = None
+            cached.clear()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
@@ -147,6 +210,44 @@ class TensorWeightSync(FullWeightSync):
             if torch.cuda.is_available():
                 torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
+        if os.environ.get("UNIRL_WEIGHT_DIGEST_VERIFY", "0") == "1":
+            self._verify_rollout_replica_digests()
+
+    def _verify_rollout_replica_digests(self) -> None:
+        import torch.distributed as dist
+
+        if not self._dist_ready():
+            raise RuntimeError(
+                "rollout replica digest verification requires distributed workers"
+            )
+        local = self._rollout.weight_digest()
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        malformed = [
+            (rank, value)
+            for rank, value in enumerate(gathered)
+            if not isinstance(value, list) or len(value) != 1
+        ]
+        if malformed:
+            raise RuntimeError(
+                "TP1 rollout digest verification expected one vLLM worker "
+                f"per DP rank; malformed={malformed}"
+            )
+        records = [value[0] for value in gathered]
+        signatures = {
+            (record.get("parameters"), record.get("sha256"))
+            for record in records
+        }
+        if len(signatures) != 1:
+            raise RuntimeError(
+                "vLLM TP1 rollout replicas received different weights: "
+                f"{records}"
+            )
+        print(
+            "[unirl.weight.digest] verified "
+            f"replicas={len(records)} signature={next(iter(signatures))}",
+            flush=True,
+        )
 
     @staticmethod
     def _serialize_payload(grouped, flat_bucket_cls, serializer_cls) -> str:

@@ -426,6 +426,29 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 segment=segment,
                 temperature=temperature,
             )
+        return self.old_policy_replay(
+            conditions,
+            segment=segment,
+            temperature=temperature,
+            return_values=return_values,
+        )
+
+    def old_policy_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+        return_values: bool = False,
+    ) -> Union[torch.Tensor, ReplayResult]:
+        """Score fixed response tokens with the actor's full-sequence forward topology.
+
+        This is the old-policy log-probability contract used by alignment
+        probes.  It deliberately bypasses ``decode_topology_replay`` so the
+        rollout comparison exercises the same packed/padded teacher-forcing
+        forward family used by the gradient-bearing actor update.
+        """
+        _require_value_head_for_replay(self.model.transformer, return_values)
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(

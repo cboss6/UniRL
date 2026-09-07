@@ -59,6 +59,9 @@ def engine_process_main(
     """Own the vLLM interpreter and serve synchronous control messages."""
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        os.environ["UNIRL_ROLLOUT_DP_RANK"] = str(
+            int(config.get("rollout_rank", 0))
+        )
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
         from vllm import LLM
@@ -81,6 +84,12 @@ def engine_process_main(
             model=str(config["pretrained_model_ckpt_path"]),
             tensor_parallel_size=int(config["tp_size"]),
             **engine_kwargs,
+        )
+        print(
+            "[unirl.vllm.runtime] "
+            f"rollout_dp_rank={os.environ['UNIRL_ROLLOUT_DP_RANK']} "
+            f"visible_devices={visible_devices}",
+            flush=True,
         )
         if os.environ.get("UNIRL_WEIGHT_DEBUG", "0") == "1":
             print(
@@ -135,6 +144,7 @@ def engine_process_main(
                     outputs = llm.generate(prompts, params, use_tqdm=False)
                     result = _plain_outputs(outputs)
                 elif command == "sleep":
+                    llm.collective_rpc("unirl_before_sleep")
                     llm.sleep(level=int(message.get("level", 1)))
                     result = None
                 elif command == "wake_up":
@@ -142,6 +152,8 @@ def engine_process_main(
                     result = None
                 elif command == "health":
                     result = True
+                elif command == "weight_digest":
+                    result = llm.collective_rpc("unirl_weight_digest")
                 elif command == "update_weights":
                     result = llm.collective_rpc(
                         "unirl_update_weights_from_tensor",

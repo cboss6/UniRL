@@ -7,6 +7,9 @@
 按实际实现来源分类的简明清单见
 [`2026-09-07-qwen3-moe-bitwise-op-kernel-source-inventory.md`](2026-09-07-qwen3-moe-bitwise-op-kernel-source-inventory.md)。
 
+公共 vLLM/Torch provider 的逐项替换与 1024-token 验证见
+[`2026-09-07-unimatch-kernel-public-replacement-validation.md`](2026-09-07-unimatch-kernel-public-replacement-validation.md)。
+
 ## 1. 范围与已签核结果
 
 本文档的历史基线为：

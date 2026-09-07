@@ -20,6 +20,29 @@ forward 得到。当前验收条件为 FP32 `max_absdiff=0`、K3 mean/max=0、
 “bitwise 签核路径”。承载梯度的 forward/backward 在第 8 节单列，不能与
 rollout-vs-old 门禁混为一谈。
 
+### 1.1 两套 provider profile
+
+本文第 4–11 节的逐 op 表首先记录高性能基线：
+
+```text
+MyUniRL4 6681ed8
+UniMatch 66119fb
+profile = unimatch/performance
+```
+
+当前 `unirl-bitwise-public-replacements` 分支还提供并默认选择
+`public/reference` profile。它已用公开 vLLM/Torch provider 替换签核前向中的
+UniMatch 自研 device kernel，并通过 TP4/EP4 1024-token 与非零更新后门禁。
+完整实现、提交、micro-gate、1024 日志和性能边界见：
+
+[`2026-09-07-unimatch-kernel-public-replacement-validation.md`](2026-09-07-unimatch-kernel-public-replacement-validation.md)
+
+因此阅读后续表格时应区分：
+
+- `unimatch/performance`：表中记录的原始 fused kernel
+- `public/reference`：vLLM BI linear/norm/reductions/softmax +
+  Torch combine/backward + per-expert vLLM BI loop
+
 ## 2. 来源标签
 
 - **UM-CUSTOM**：UniMatch 自研的 CuTe/CUTLASS/Triton kernel 或自定义
@@ -86,6 +109,19 @@ UNIMATCH_DEEPEP_MODE=ht
 UNIMATCH_DEEPEP_ASYNC_FINISH=0
 ```
 
+公共替代分支额外默认启用：
+
+```text
+UNIMATCH_RMSNORM_PROVIDER=vllm_bi
+UNIMATCH_RMSNORM_BACKWARD_PROVIDER=torch
+UNIMATCH_REDUCTION_PROVIDER=vllm_bi
+UNIMATCH_MOE_COMBINE_PROVIDER=torch
+UNIMATCH_DENSE_PROVIDER=vllm_bi
+UNIMATCH_GROUPED_PROVIDER=vllm_bi_loop
+UNIMATCH_GATE_PROVIDER=vllm_bi
+UNIMATCH_ROUTER_SOFTMAX_PROVIDER=vllm_bi
+```
+
 入口：
 
 - `examples/run_qwen3_moe_fsdp_vllm_tp4_bitwise.sh:26-45`
@@ -148,7 +184,7 @@ UNIMATCH_DEEPEP_ASYNC_FINISH=0
 | RoPE frequency | UniMatch canonical FP32 inverse-frequency patch | 同左 | UniMatch FSDP patch，以 Torch FP32 构造 | UniMatch `rotary_frequencies_vllm_exact`，Torch FP32 | UM-WRAPPER + TORCH |
 | RoPE apply | UniMatch 替换 vLLM CUDA RoPE 为显式 eager NeoX 运算 | 同左 | Transformers eager rotate | VeOmni OpSlot `unimatch_vllm_exact`，内部为 Torch BF16 乘加/拼接 | UM-WRAPPER + TORCH |
 | Attention core | vLLM Hopper FA3；UniMatch 仅激活 vLLM attention BI gate，强制 `num_splits=1` | 同左 | UniMatch wrapper 调用 vLLM bundled FA3 varlen，`deterministic=True, num_splits=1` | 同一 vLLM bundled FA3 contract | VLLM-NATIVE + UM-WRAPPER |
-| Attention o_proj | UniMatch TP column-parallel dense + input AllGather + fused output AllGather | TP1 特例直接调用 `linear_batch_invariant` | exact ATen linear -> `linear_batch_invariant` | exact ATen linear -> `linear_batch_invariant` | UM-CUSTOM（TP4 rollout）/ VLLM-BI-DIRECT（actors、TP1） |
+| Attention o_proj | vLLM TP-group input AllGather + UniMatch TP column-parallel dense/fused output AllGather | 在 `UNIMATCH_VEOMNI_EP4_EXACT=1` 的当前 TP1 配置中直接调用 `linear_batch_invariant` | exact ATen linear -> `linear_batch_invariant` | exact ATen linear -> `linear_batch_invariant` | VLLM-NATIVE/NCCL + UM-CUSTOM（TP4 rollout）/ VLLM-BI-DIRECT（actors、当前 VeOmni TP1 配置） |
 | Router gate GEMM | UniMatch `DenseGemmBF16Fp32Out` | 同左 | exact ATen 特例 `(N=128,K=2048)` -> UniMatch BF16/FP32-out GEMM | 相同 ATen 特例 | UM-CUSTOM |
 | Router softmax | `vllm_softmax_kernel.row_softmax` | 同左 | ATen softmax override -> 同一 `row_softmax` | ATen softmax override -> 同一 `row_softmax` | EXTERNAL |
 | Router top-k | `torch.topk` | `torch.topk` | `torch.topk` | `torch.topk` | TORCH |
@@ -290,8 +326,11 @@ rollout-vs-no-grad-old-logprob 的严格签核结论。
 3. Actor FA3 通过 UniMatch 暴露成 Transformers 期望的模块接口，但底层
    `flash_attn_varlen_func` 来自 `vllm.vllm_flash_attn`：归为
    VLLM-NATIVE + UM-WRAPPER。
-4. TP1 QKV/o_proj/LM head 的 wrapper 位于 UniMatch，但 exact 分支直接调用
-   vLLM `linear_batch_invariant`：归为 VLLM-BI-DIRECT。
+4. 当前 VeOmni EP4 签核配置同时满足
+   `UNIMATCH_VEOMNI_EP4_EXACT=1` 与 vLLM TP1；此时 QKV/o_proj/LM head 的
+   wrapper 位于 UniMatch，但 exact 分支直接调用 vLLM
+   `linear_batch_invariant`：归为 VLLM-BI-DIRECT。一般 TP1 若未启用该开关，
+   不能据此归类。
 5. `rotary_vllm_exact.py` 位于 UniMatch 且命名为 kernel，但当前实现是
    PyTorch BF16 slice/mul/add/cat expression，不是独立 Triton/CuTe kernel：
    归为 TORCH + UM-WRAPPER。

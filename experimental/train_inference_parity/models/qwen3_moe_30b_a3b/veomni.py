@@ -233,8 +233,15 @@ def _install_generated_model_patches() -> None:
             self.config.hidden_size // self.config.num_attention_heads
         )
         inverse = 1.0 / (base ** (torch.arange(0, dimension, 2, dtype=torch.float32, device=x.device) / dimension))
-        frequencies = (inverse[None, :, None] * position_ids[:, None, :].float()).transpose(1, 2)
-        embedding = torch.cat((frequencies, frequencies), dim=-1)
+        expanded_frequency = inverse[None, :, None].expand(
+            position_ids.shape[0],
+            -1,
+            1,
+        )
+        expanded_positions = position_ids[:, None, :].float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            frequencies = (expanded_frequency.float() @ expanded_positions.float()).transpose(1, 2)
+            embedding = torch.cat((frequencies, frequencies), dim=-1)
         return (
             (embedding.cos() * self.attention_scaling).to(x.dtype),
             (embedding.sin() * self.attention_scaling).to(x.dtype),

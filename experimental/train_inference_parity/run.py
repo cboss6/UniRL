@@ -10,7 +10,9 @@ from omegaconf import DictConfig
 
 from experimental.train_inference_parity.lifecycle import (
     apply_profile_environment,
+    connect_ray_with_parity_environment,
     require_vllm_plugin_installed,
+    write_launch_manifest,
 )
 from experimental.train_inference_parity.profiles import resolve_profile
 from unirl.trainer.ar import ARTrainer
@@ -30,6 +32,14 @@ def main(cfg: DictConfig) -> None:
     os.environ["UNIRL_PARITY_TRAIN_EP_SIZE"] = str(parity.get("train_ep", 1))
     os.environ["UNIRL_PARITY_NUM_EXPERTS"] = "128"
     require_vllm_plugin_installed()
+    connect_ray_with_parity_environment()
+    write_launch_manifest(
+        cfg.get(
+            "parity_manifest_path",
+            "logs/train_inference_parity_manifest.json",
+        ),
+        profile=profile,
+    )
     trainer = None
 
     def teardown() -> None:

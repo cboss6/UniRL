@@ -16,9 +16,14 @@ def _emit(stage: str, value, *, layer: int, call: int) -> None:
         return
     rank = int(os.environ.get("RANK", "0"))
     try:
-        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
 
         rank = int(get_tensor_model_parallel_rank())
+        if int(get_tensor_model_parallel_world_size()) == 1:
+            rank = int(os.environ.get("UNIRL_ROLLOUT_DP_RANK", rank))
     except Exception:
         pass
     directory = Path(root) / os.environ.get("UNIRL_PARITY_DUMP_RUN_ID", "run") / "vllm" / f"rank{rank:02d}"

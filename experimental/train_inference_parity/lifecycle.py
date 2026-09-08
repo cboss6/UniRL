@@ -33,6 +33,34 @@ def require_vllm_plugin_installed() -> None:
         )
 
 
+def connect_ray_with_parity_environment() -> None:
+    """Connect the driver and propagate parity variables to every Ray role."""
+    import ray
+
+    if ray.is_initialized():
+        return
+    prefixes = ("UNIRL_PARITY_", "UNIRL_DEEPEP_", "DEEPEP_")
+    explicit = {
+        "CUBLAS_WORKSPACE_CONFIG",
+        "CUDA_VISIBLE_DEVICES",
+        "FLASH_ATTENTION_DETERMINISTIC",
+        "HF_HUB_OFFLINE",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "QWEN3_MOE_PATH",
+        "TRANSFORMERS_OFFLINE",
+        "VLLM_BATCH_INVARIANT",
+        "VLLM_PLUGINS",
+        "VLLM_WORKER_MULTIPROC_METHOD",
+    }
+    env_vars = {key: value for key, value in os.environ.items() if key in explicit or key.startswith(prefixes)}
+    ray.init(
+        address=os.environ.get("RAY_ADDRESS", "auto"),
+        runtime_env={"env_vars": env_vars},
+    )
+
+
 def write_launch_manifest(path: str | os.PathLike[str], *, profile: ProfileConfig) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +77,7 @@ __all__ = [
     "PLUGIN_DISTRIBUTION",
     "PLUGIN_ENTRYPOINT",
     "apply_profile_environment",
+    "connect_ray_with_parity_environment",
     "require_vllm_plugin_installed",
     "write_launch_manifest",
 ]

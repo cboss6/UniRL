@@ -59,6 +59,23 @@ def _linear_cuda(input, weight, bias=None):
     return output.reshape(*original_shape[:-1], output.shape[-1])
 
 
+def _linear_backward_cuda(input, grad_output, weight, output_mask):
+    input_2d = input.reshape(-1, input.shape[-1])
+    grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
+    grad_input = (
+        torch.matmul(grad_output, weight) if output_mask[0] else torch.empty(0, device=input.device, dtype=input.dtype)
+    )
+    grad_weight = (
+        torch.matmul(grad_2d.t(), input_2d)
+        if output_mask[1]
+        else torch.empty(0, device=weight.device, dtype=weight.dtype)
+    )
+    grad_bias = (
+        grad_2d.sum(dim=0) if output_mask[2] else torch.empty(0, device=grad_output.device, dtype=grad_output.dtype)
+    )
+    return grad_input, grad_weight, grad_bias
+
+
 def _softmax_cuda(input, dim, dtype=None):
     source = input if dtype is None else input.to(dtype)
     return _providers().softmax(source.contiguous(), dim=dim)
@@ -74,6 +91,7 @@ def register_aten() -> None:
         return
     library = torch.library.Library("aten", "IMPL")
     library.impl("aten::linear", _linear_cuda, "CUDA")
+    library.impl("aten::linear_backward", _linear_backward_cuda, "CUDA")
     try:
         library.impl("aten::softmax", _softmax_cuda, "CUDA")
         library.impl("aten::_softmax", _softmax_internal_cuda, "CUDA")

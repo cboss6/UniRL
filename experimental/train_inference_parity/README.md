@@ -102,11 +102,43 @@ The actor and vLLM plugin write rank/layer/call tensor files beneath that root.
 
 | Profile | Topology | Response | Chunked prefill | Prefix cache | Update/reload | Status |
 |---|---|---:|---:|---:|---:|---|
-| public_reference | FSDP4 / vLLM TP4 | 1024 | off/on | off/on | one step | migration pending |
-| public_reference | VeOmni EP4 / 4×TP1 | 1024 | off/on | off/on | one step + reload | migration pending |
+| public_reference | FSDP4 / vLLM TP4 | 1024 | on | on | two steps + reload | PASS |
+| public_reference | VeOmni EP4 / 4×TP1 | 1024 | on, budget=128 | on | two steps + reload + 4-replica digest | PASS |
 | optimized | both | 1024 | — | — | — | blocked on provenance/license |
 
-The historical source implementation and public-provider results are documented
-under `docs/2026-09-07-*.md`. This README's table only becomes PASS after the
-experimental package itself, without the external UniMatch plugin, completes the
-same gates.
+Both PASS rows were run from this experimental package with
+`VLLM_PLUGINS=unirl_train_inference_parity` and no external UniMatch plugin.
+Every rank reported:
+
+```text
+token_count=4096
+torch_equal=True
+mismatch_count=0
+max_absdiff_fp32=0
+k3_mean=0
+k3_max=0
+```
+
+FSDP/TP4:
+
+```text
+rollout 1: grad_norm=0.6523
+rollout 2: grad_norm=1.0078
+```
+
+VeOmni EP4:
+
+```text
+rollout 1: grad_norm=1.7114
+updated replicas=4 digest=c066983de34fb0f1f35b70e299c97676521123d8a59c1f5298dca0a7f601bd70
+rollout 2: grad_norm=1.9102
+```
+
+During migration, EP4 initially differed by one FP32 ULP because the parity
+topology variables were set after connecting to an existing Ray cluster.
+`run.py` now creates a Ray job runtime environment before any role is spawned,
+so `UNIRL_PARITY_TRAIN_EP_SIZE=4` reaches actor and rollout workers
+consistently.
+
+The repository wheel was also built and inspected: 595 wheel entries, zero
+`experimental/` or `train_inference_parity` entries.

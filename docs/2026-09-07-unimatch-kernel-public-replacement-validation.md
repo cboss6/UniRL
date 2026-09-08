@@ -431,3 +431,133 @@ unimatch/performance:
 后续若公共 vLLM 增加 batch-invariant grouped GEMM、FP32-output linear 与
 column-parallel AllGather API，可逐项替换 performance profile，而不必再复制
 或独立维护 kernel。
+
+## 9. Chunked prefill 与 prefix cache 逐步开启验证
+
+日期：2026-09-08
+
+公共 provider 最终栈上继续执行四组真实单步训练。公共配置为：
+
+```text
+model=Qwen3-30B-A3B
+model dtype=BF16
+logprob dtype=FP32
+data=/tmp/unirl_gsm8k_4_7.jsonl
+prompt ids=gsm8k-train-4..7
+chat-templated prompt lengths=[49,88,80,129]
+samples_per_prompt=4
+response length=1024
+ignore_eos=true
+alignment_gate_only=false
+num_rollouts=1
+```
+
+每个 actor rank 处理 4 条 response，共 4096 response tokens，并执行
+old-logprob exact gate、backward 和 optimizer step。
+
+### 9.1 阶段一：只开启 chunked prefill
+
+TP4：
+
+```text
+rollout=vLLM TP4
+actor=FSDP world 4
+GPUs=0..3
+enable_chunked_prefill=true
+enable_prefix_caching=false
+max_num_batched_tokens=1280
+max_num_seqs=16
+wall time=1383.3 s
+grad_norm=0.7266
+```
+
+16 条并发请求的总 prompt tokens 超过 1280，实际经过 chunked scheduler。
+
+日志：
+
+`logs/qwen3_moe_fsdp_vllm_tp4_bitwise_20260908_122534.log`
+
+VeOmni EP4：
+
+```text
+rollout=4 × vLLM TP1
+actor=VeOmni DP4/EP4/EP-FSDP1
+GPUs=4..7
+enable_chunked_prefill=true
+enable_prefix_caching=false
+max_num_batched_tokens=128
+max_num_seqs=1
+wall time=1106.1 s
+grad_norm=1.8249
+```
+
+EP4 默认每个 TP1 的 budget 为 1280，最长 prompt 只有 129，单纯打开开关不会
+实际切分。该实验将 budget 降至 128，使最长 prompt 必须跨 chunk。
+
+日志：
+
+`logs/qwen3_moe_veomni_ep4_vllm_tp1_bitwise_20260908_124911.log`
+
+两组结果均为：
+
+```text
+torch_equal=True
+mismatch_count=0
+max_absdiff_fp32=0
+k3_mean=0
+k3_max=0
+```
+
+### 9.2 阶段二：在 chunked prefill 基础上开启 prefix cache
+
+TP4：
+
+```text
+enable_chunked_prefill=true
+enable_prefix_caching=true
+max_num_batched_tokens=1280
+max_num_seqs=16
+wall time=1391.3 s
+grad_norm=0.6523
+```
+
+日志：
+
+`logs/qwen3_moe_fsdp_vllm_tp4_bitwise_20260908_130814.log`
+
+VeOmni EP4：
+
+```text
+enable_chunked_prefill=true
+enable_prefix_caching=true
+max_num_batched_tokens=128
+max_num_seqs=1
+wall time=1088.2 s
+grad_norm=1.7118
+```
+
+日志：
+
+`logs/qwen3_moe_veomni_ep4_vllm_tp1_bitwise_20260908_133215.log`
+
+每个 prompt 生成 4 个 samples，因此 prefix cache 存在可复用的重复前缀。
+当前 recipe 使用 `disable_log_stats=true`，日志不包含 cache hit-rate，不能据此
+量化实际命中比例。
+
+两组 strict gate 同样全部为：
+
+```text
+torch_equal=True
+mismatch_count=0
+max_absdiff_fp32=0
+k3_mean=0
+k3_max=0
+```
+
+### 9.3 结论
+
+- Chunked prefill 不改变 rollout-vs-old-logprob bitwise 对齐。
+- 在 chunked prefill 上再开启 prefix cache 仍不改变 bitwise 对齐。
+- TP4 和 TP1×4/VeOmni EP4 都完成真实 backward/optimizer step，不是
+  gate-only 或离线 UT。
+- 四组均直接通过，无不一致 token，因此没有需要定位或修复的 op/kernel。

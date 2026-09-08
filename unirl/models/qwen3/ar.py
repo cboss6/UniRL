@@ -26,6 +26,8 @@ from .conditions import Qwen3ARConditions
 
 logger = logging.getLogger(__name__)
 _LM_DEBUGGED = False
+_EXACT_CONTEXT_FACTORY = None
+_EXACT_LOG_SOFTMAX = None
 
 _SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
 
@@ -56,14 +58,15 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
 
 def _exact_actor_enabled(model: Any) -> bool:
     return bool(
-        getattr(model, "_unirl_exact_actor_logprobs", False)
-        and ((not model.training) or (not torch.is_grad_enabled()))
+        getattr(model, "_unirl_exact_actor_logprobs", False) and ((not model.training) or (not torch.is_grad_enabled()))
     )
 
 
 def _exact_actor_context(model: Any):
     if not _exact_actor_enabled(model):
         return nullcontext()
+    if _EXACT_CONTEXT_FACTORY is not None:
+        return _EXACT_CONTEXT_FACTORY()
     from unimatch.adaptor.fsdp.hf_aten import exact_mode, register_aten
 
     register_aten()
@@ -79,10 +82,7 @@ def _selected_token_log_probs(
     global _LM_DEBUGGED
     with _exact_actor_context(model):
         logits = model.lm_head(hidden).float() / temperature
-        if (
-            not _LM_DEBUGGED
-            and __import__("os").environ.get("UNIMATCH_LM_DEBUG", "0") == "1"
-        ):
+        if not _LM_DEBUGGED and __import__("os").environ.get("UNIMATCH_LM_DEBUG", "0") == "1":
             token_id = int(tokens.reshape(-1)[0])
             print(
                 "[unimatch.fsdp.lm.debug] "
@@ -94,13 +94,22 @@ def _selected_token_log_probs(
             )
             _LM_DEBUGGED = True
         if _exact_actor_enabled(model):
+            if _EXACT_LOG_SOFTMAX is not None:
+                return _EXACT_LOG_SOFTMAX(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
             from unimatch.functional.reductions import log_softmax
 
-            return log_softmax(logits, dim=-1).gather(
-                -1, tokens.unsqueeze(-1)
-            ).squeeze(-1)
+            return log_softmax(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
         chosen = logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
         return chosen - torch.logsumexp(logits, dim=-1)
+
+
+def register_exact_actor_provider(*, context_factory, log_softmax) -> None:
+    """Register a process-local exact provider without importing experimental code."""
+    global _EXACT_CONTEXT_FACTORY, _EXACT_LOG_SOFTMAX
+    if not callable(context_factory) or not callable(log_softmax):
+        raise TypeError("exact actor providers must be callable")
+    _EXACT_CONTEXT_FACTORY = context_factory
+    _EXACT_LOG_SOFTMAX = log_softmax
 
 
 def _replay_aware_forward(
@@ -414,11 +423,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
     ) -> Union[torch.Tensor, ReplayResult]:
         """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
         _require_value_head_for_replay(self.model.transformer, return_values)
-        if (
-            self.exact_actor_decode_replay
-            and not torch.is_grad_enabled()
-            and not return_values
-        ):
+        if self.exact_actor_decode_replay and not torch.is_grad_enabled() and not return_values:
             return self.decode_topology_replay(
                 conditions,
                 segment=segment,
@@ -508,11 +513,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             row_tokens = response[cu[batch_index] : cu[batch_index] + response_length]
             row_logprobs: List[torch.Tensor] = []
             logits = output.logits[:, -1, :].float() / scale
-            row_logprobs.append(
-                log_softmax(logits, dim=-1).gather(
-                    -1, row_tokens[0].view(1, 1)
-                ).reshape(())
-            )
+            row_logprobs.append(log_softmax(logits, dim=-1).gather(-1, row_tokens[0].view(1, 1)).reshape(()))
             for token_offset in range(1, response_length):
                 input_token = row_tokens[token_offset - 1].view(1, 1)
                 attention_mask = torch.ones(
@@ -532,9 +533,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 past = output.past_key_values
                 logits = output.logits[:, -1, :].float() / scale
                 row_logprobs.append(
-                    log_softmax(logits, dim=-1).gather(
-                        -1, row_tokens[token_offset].view(1, 1)
-                    ).reshape(())
+                    log_softmax(logits, dim=-1).gather(-1, row_tokens[token_offset].view(1, 1)).reshape(())
                 )
             pieces.append(torch.stack(row_logprobs))
 
@@ -760,4 +759,9 @@ def _pack_text_segment(
     )
 
 
-__all__ = ["Qwen3ARParams", "Qwen3ARStage", "Qwen3ARStep"]
+__all__ = [
+    "Qwen3ARParams",
+    "Qwen3ARStage",
+    "Qwen3ARStep",
+    "register_exact_actor_provider",
+]

@@ -9,19 +9,27 @@ class UniRLWeightSyncExtension:
     """Deserialize a UniRL tensor bucket inside each TP worker."""
 
     def unirl_before_sleep(self) -> None:
-        """Drop cached UniMatch buffers whose CuMem mappings will be released."""
+        """Drop optional plugin caches whose CuMem mappings will be released."""
+        import sys
+
         import torch
 
         torch.cuda.synchronize()
-        from unimatch.adaptor.vllm.patches.qwen3_dualcol import qwen3_modules
-        from unimatch.adaptor.vllm.patches.qwen3_moe_dualcol import (
-            gate_fp32,
-            grouped_runner,
+        model = self.model_runner.get_model()
+        for module in model.modules():
+            cleanup = getattr(module, "_unirl_before_sleep", None)
+            if callable(cleanup):
+                cleanup()
+        optional_modules = (
+            "unimatch.adaptor.vllm.patches.qwen3_dualcol.qwen3_modules",
+            "unimatch.adaptor.vllm.patches.qwen3_moe_dualcol.grouped_runner",
+            "unimatch.adaptor.vllm.patches.qwen3_moe_dualcol.gate_fp32",
         )
-
-        qwen3_modules.close_all()
-        grouped_runner.close_all()
-        gate_fp32.close_all()
+        for name in optional_modules:
+            module = sys.modules.get(name)
+            close = getattr(module, "close_all", None)
+            if callable(close):
+                close()
         torch.cuda.synchronize()
 
     def unirl_weight_digest(self) -> dict:
@@ -46,9 +54,7 @@ class UniRLWeightSyncExtension:
             digest.update(name.encode("utf-8"))
             digest.update(str(tuple(parameter.shape)).encode("ascii"))
             digest.update(str(parameter.dtype).encode("ascii"))
-            digest.update(
-                sample.view(torch.uint8).cpu().numpy().tobytes()
-            )
+            digest.update(sample.view(torch.uint8).cpu().numpy().tobytes())
             count += 1
         return {
             "rank": int(getattr(self, "rank", 0)),
@@ -79,27 +85,20 @@ class UniRLWeightSyncExtension:
 
     def unirl_begin_debug(self, record_id: str = "batch") -> None:
         import os
+        import sys
 
+        if os.environ.get("UNIRL_PARITY_DUMP_DIR"):
+            os.environ["UNIRL_PARITY_DUMP_RECORD"] = str(record_id)
         if os.environ.get("UNIMATCH_STAGE_DUMP_DIR"):
             os.environ["UNIMATCH_STAGE_DUMP_RECORD"] = str(record_id)
-            from unimatch.diagnostics.stage_dump import set_stage_dump_record
-
-            set_stage_dump_record(str(record_id))
-            print(
-                f"[unirl_begin_debug] stage dump record={record_id}",
-                flush=True,
-            )
-        from unimatch.adaptor.vllm.patches.qwen3_dualcol import qwen3_modules
-        from unimatch.adaptor.vllm.patches.qwen3_moe_dualcol import (
-            gate_fp32,
-            hf_router,
-        )
-
-        qwen3_modules._ATTENTION_DEBUGGED = False
-        qwen3_modules._OPROJ_DEBUGGED = False
-        qwen3_modules._LM_DEBUGGED = False
-        gate_fp32._GATE_DEBUGGED = False
-        hf_router._ROUTER_DEBUGGED = False
+            diagnostics = sys.modules.get("unimatch.diagnostics.stage_dump")
+            setter = getattr(diagnostics, "set_stage_dump_record", None)
+            if callable(setter):
+                setter(str(record_id))
+        for module in self.model_runner.get_model().modules():
+            reset = getattr(module, "_unirl_reset_debug", None)
+            if callable(reset):
+                reset()
 
     def unirl_update_weights_from_tensor(
         self,

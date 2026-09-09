@@ -57,9 +57,7 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
 
 
 def _exact_actor_enabled(model: Any) -> bool:
-    return bool(
-        getattr(model, "_unirl_exact_actor_logprobs", False) and ((not model.training) or (not torch.is_grad_enabled()))
-    )
+    return bool(getattr(model, "_unirl_exact_actor_logprobs", False))
 
 
 def _exact_actor_context(model: Any):

@@ -140,7 +140,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         )
         self._process.start()
         child.close()
-        ready = self._recv(timeout_s=1800.0)
+        ready = self._recv(timeout_s=self.cfg.request_timeout_s)
         if ready.get("event") != "ready":
             raise RuntimeError(f"direct vLLM returned invalid startup event: {ready!r}")
         logger.info(
@@ -268,7 +268,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         with self._lock:
             connection = self._require_connection()
             connection.send({"command": command, **payload})
-            return self._recv(timeout_s=1800.0).get("result")
+            return self._recv(timeout_s=self.cfg.request_timeout_s).get("result")
 
     def _recv(self, *, timeout_s: float) -> Dict[str, Any]:
         connection = self._require_connection()

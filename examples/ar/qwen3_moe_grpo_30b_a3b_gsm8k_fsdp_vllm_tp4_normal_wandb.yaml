@@ -1,0 +1,48 @@
+# @package _global_
+defaults:
+  - qwen3_moe_grpo_30b_a3b_gsm8k_fsdp_vllm_tp4_bitwise
+  - _self_
+
+num_rollouts: 100
+batch_size: 4
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-qwen3-moe-parity
+  run_name: qwen3-30b-a3b-tp4-normal-n8-r1024
+  entity: null
+  tags: [qwen3-moe, normal, tp4, gsm8k, n8, response-1024]
+
+bundle:
+  config:
+    attn_implementation: sdpa
+    exact_actor_logprobs: false
+    exact_actor_decode_replay: false
+    external_libs: null
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  exact_actor_logprobs: false
+  exact_actor_decode_replay: false
+
+rollout:
+  config:
+    max_new_tokens: 1024
+    ignore_eos: true
+    engine_kwargs:
+      max_model_len: 1280
+      max_num_batched_tokens: 1280
+      max_num_seqs: 16
+      enable_chunked_prefill: true
+      enable_prefix_caching: true
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  horizon: 1024
+  alignment_probe: false
+  alignment_gate_only: false
+  alignment_require_exact: false
+
+sampling:
+  samples_per_prompt: 8
+  max_new_tokens: 1024

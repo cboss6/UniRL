@@ -2,9 +2,15 @@
 
 Owner: UniRL Qwen3-MoE parity maintainers
 
-This package incubates exact rollout-versus-old-policy log-probability
-contracts without shipping monkey patches or experimental kernels in the UniRL
-wheel.
+This package incubates exact rollout-versus-old-policy and
+rollout-versus-gradient-replay log-probability contracts without shipping
+monkey patches or experimental kernels in the UniRL wheel.
+
+It contains only the bitwise experiment. The normal baseline is the original
+UniRL Qwen3-MoE AR path: launch
+`examples/ar/qwen3_moe_grpo_30b_a3b_gsm8k_fsdp_vllm_tp4_normal_wandb.yaml`
+with `python -m unirl.train_ar` and set `VLLM_PLUGINS=""`. The baseline does
+not use this package, its entry point, profiles, model wrappers, or vLLM plugin.
 
 ## Scope
 
@@ -14,7 +20,8 @@ The first model profile is `Qwen3-30B-A3B`:
 experimental model id: qwen3_moe_30b_a3b
 actor scoring: full prompt+response no-grad forward
 comparison dtype: FP32
-required metrics: max_absdiff=0, K3 mean/max=0, torch.equal=true
+required old-policy metrics: max_absdiff=0, K3 mean/max=0, torch.equal=true
+required gradient-replay metrics: max_absdiff=0, K3 mean/max=0, torch.equal=true
 ```
 
 Supported topologies:

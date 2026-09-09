@@ -6,7 +6,7 @@ from unirl.algorithms.grpo import GRPO
 
 
 class TrainInferenceParityGRPO(GRPO):
-    """GRPO with a fail-closed full-sequence old-policy parity probe."""
+    """GRPO with fail-closed old-policy and gradient-replay parity gates."""
 
     def __init__(
         self,

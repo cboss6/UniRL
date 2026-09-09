@@ -22,6 +22,7 @@ class VLLMEngineConfig(BaseEngineConfig):
     top_p: float = 0.9
     top_k: int = 0
     ignore_eos: bool = False
+    request_timeout_s: float = 1800.0
     system_instruction: Optional[str] = None
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
     engine_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -40,6 +41,7 @@ class VLLMEngineConfig(BaseEngineConfig):
         require(self.max_new_tokens >= 1, "VLLMEngineConfig.max_new_tokens must be >= 1")
         require(self.temperature > 0, "VLLMEngineConfig.temperature must be > 0")
         require(0.0 < self.top_p <= 1.0, "VLLMEngineConfig.top_p must be in (0, 1]")
+        require(self.request_timeout_s > 0, "VLLMEngineConfig.request_timeout_s must be > 0")
 
 
 __all__ = ["VLLMEngineConfig"]

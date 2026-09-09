@@ -19,6 +19,7 @@ def apply_profile_environment(profile: ProfileConfig) -> None:
     os.environ["UNIRL_PARITY_MODEL"] = "qwen3_moe_30b_a3b"
     os.environ["UNIRL_PARITY_STRICT"] = "1"
     os.environ["VLLM_PLUGINS"] = PLUGIN_ENTRYPOINT
+    os.environ["UNIRL_PARITY_PATCHES"] = "common,qwen3_moe_30b_a3b"
     for name, value in profile.providers.items():
         os.environ[f"UNIRL_PARITY_{name.upper()}_PROVIDER"] = value
 

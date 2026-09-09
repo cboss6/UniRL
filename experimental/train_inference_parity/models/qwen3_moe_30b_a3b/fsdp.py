@@ -106,6 +106,28 @@ def exact_context():
     return exact_mode(True)
 
 
+class _LogSoftmax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, dim):
+        output = _providers().log_softmax(input, dim=int(dim))
+        ctx.save_for_backward(output)
+        ctx.dim = int(dim)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (output,) = ctx.saved_tensors
+        grad_input = grad_output - output.exp() * grad_output.sum(
+            dim=ctx.dim,
+            keepdim=True,
+        )
+        return grad_input, None
+
+
+def _log_softmax(input, dim=-1):
+    return _LogSoftmax.apply(input, dim)
+
+
 class _RmsNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, eps):
@@ -527,7 +549,7 @@ def install() -> None:
     register_aten()
     register_exact_actor_provider(
         context_factory=exact_context,
-        log_softmax=_providers().log_softmax,
+        log_softmax=_log_softmax,
     )
     _install_fa3()
     from transformers.models.qwen3_moe import modeling_qwen3_moe as modeling
